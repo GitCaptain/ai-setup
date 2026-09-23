@@ -16,6 +16,7 @@ AI_USER="ompai"
 AI_HOME="/var/lib/ompai"
 SHARE_GROUP="ompai-share"
 WORKSPACE="/srv/ompai/workspace"
+MODEL_STORE="/var/lib/ompai/models"
 ETC_DIR="/etc/ompai"
 
 LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
@@ -58,6 +59,7 @@ Normal usage:
 Options (override config):
   --config PATH
   --model PATH            Import a GGUF file/bundle (repeatable)
+  --model-store PATH      Host directory used as the persistent model store
   --models-max N          Max simultaneously loaded router models
   --ctx TOKENS
   --vram-reserve MIB
@@ -77,6 +79,13 @@ Options (override config):
 The config is parsed as data, not sourced as shell code.
 EOF
 }
+
+# Let --help work even when the script is only being inspected as root.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+  esac
+done
 
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
@@ -142,6 +151,7 @@ set_config_key() {
     AI_HOME) AI_HOME="$value" ;;
     SHARE_GROUP) SHARE_GROUP="$value" ;;
     WORKSPACE) WORKSPACE="$value" ;;
+    MODEL_STORE) MODEL_STORE="$value" ;;
 
     MODEL|MODEL_PATH) [[ -n "$value" ]] && INITIAL_MODELS+=("$value") ;;
     MODELS_MAX) MODELS_MAX="$value" ;;
@@ -219,6 +229,7 @@ while (($#)); do
     --config)           shift 2 ;;
     --config=*)         shift ;;
     --model)            INITIAL_MODELS+=("${2:?missing value}"); shift 2 ;;
+    --model-store)      MODEL_STORE="${2:?missing value}"; shift 2 ;;
     --models-max)       MODELS_MAX="${2:?missing value}"; shift 2 ;;
     --ctx)              LLAMA_CTX="${2:?missing value}"; shift 2 ;;
     --vram-reserve)     VRAM_RESERVE_MIB="${2:?missing value}"; shift 2 ;;
@@ -240,6 +251,16 @@ done
 
 HARDEN_HOME="$(bool_to_int "$HARDEN_HOME")"
 ASSUME_YES="$(bool_to_int "$ASSUME_YES")"
+
+# MODEL_STORE is a host path managed by root and exposed read-only to llama.cpp.
+# Keep it outside the desktop user's home so HOME=0700 remains a useful boundary.
+[[ "$MODEL_STORE" = /* ]] || die "MODEL_STORE must be an absolute host path"
+[[ "$MODEL_STORE" != "/" ]] || die "MODEL_STORE must not be /"
+case "$MODEL_STORE" in
+  "$MAIN_HOME"|"$MAIN_HOME"/*)
+    die "MODEL_STORE must be outside your normal home ($MAIN_HOME); use /var/lib/ompai/models, /srv/..., or /mnt/..."
+    ;;
+esac
 
 case "${WEB_SEARCH_PRIMARY,,}" in
   auto)
@@ -445,7 +466,8 @@ root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 \
   "$AI_HOME/src" \
   "$AI_HOME/build"
 
-root install -d -o root -g "$AI_GID" -m 0750   "$AI_HOME/models"   "$AI_HOME/secrets"
+root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets"
+root install -d -o root -g "$AI_GID" -m 0750 "$MODEL_STORE"
 root install -d -o root -g root -m 0755 "$ETC_DIR"
 
 SECRET_ENV="$AI_HOME/secrets/omp.env"
@@ -484,12 +506,12 @@ install_model_source() {
   local src="$1" name dest tmp
   validate_model_source "$src"
   name="$(basename "$src")"
-  dest="$AI_HOME/models/$name"
+  dest="$MODEL_STORE/$name"
   if [[ -e "$dest" ]]; then
     log "Model already present, skipping: $name"
     return
   fi
-  tmp="$AI_HOME/models/.import-${name}.$$"
+  tmp="$MODEL_STORE/.import-${name}.$$"
   root rm -rf -- "$tmp"
   log "Importing model: $src -> $dest"
   if [[ -f "$src" ]]; then
@@ -511,7 +533,7 @@ for src in "${INITIAL_MODELS[@]}"; do
   install_model_source "$src"
 done
 
-if ! root find "$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
+if ! root find "$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q .; then
   warn "No models installed yet. Use: ai-model add /path/to/model.gguf"
 fi
 
@@ -655,6 +677,7 @@ set -Eeuo pipefail
 
 AI_HOME="$AI_HOME"
 WORKSPACE="$WORKSPACE"
+MODEL_STORE="$MODEL_STORE"
 LLAMA_IMAGE="$LLAMA_IMAGE"
 LLAMA_PORT="$LLAMA_PORT"
 LLAMA_CTX="$LLAMA_CTX"
@@ -696,7 +719,7 @@ case "\${1:-}" in
     exit 0
     ;;
   status)
-    podman ps -a --filter "name=^${OMP_NAME}$" --filter "name=^${LLAMA_NAME}$"
+    podman ps -a --filter "name=^\${OMP_NAME}$" --filter "name=^\${LLAMA_NAME}$"
     exit 0
     ;;
   logs)
@@ -728,7 +751,7 @@ if [[ "\$candidate" != "\$WORKSPACE" ]]; then
   container_workdir="/workspace/\${candidate#"\$WORKSPACE/"}"
 fi
 
-if ! find "\$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
+if ! find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q .; then
   echo "No GGUF models installed." >&2
   echo "Use: ai-model add /path/to/model.gguf" >&2
   exit 3
@@ -762,7 +785,7 @@ podman run -d \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-  --mount "type=bind,src=\$AI_HOME/models,dst=/models,ro=true,bind-nonrecursive" \
+  --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" \
   -p "127.0.0.1:\$LLAMA_PORT:8080" \
   "\$LLAMA_IMAGE" \
     --models-dir /models \
@@ -926,7 +949,7 @@ MAIN_USER="$MAIN_USER"
 AI_HOME="$AI_HOME"
 AI_UID="$AI_UID"
 AI_GID="$AI_GID"
-MODELS_DIR="$AI_HOME/models"
+MODELS_DIR="$MODEL_STORE"
 
 [[ "\$(id -u)" -eq 0 ]] || { echo "model helper must run as root" >&2; exit 1; }
 
@@ -1052,6 +1075,7 @@ Usage:
   ai-model list
   ai-model path
 
+`ai-model path` prints the configured host MODEL_STORE.
 A FILE must be GGUF. A DIR is treated as one llama.cpp model bundle and may
 contain sharded GGUF files and/or mmproj*.gguf. Changes are allowed only while
 omp-ai is stopped; the next omp-ai launch rescans --models-dir.
@@ -1155,6 +1179,7 @@ ok "Podman-based OMP environment is ready."
 echo
 echo "Isolation user:       $AI_USER (login disabled)"
 echo "Workspace:            $WORKSPACE"
+echo "Model store:          $MODEL_STORE"
 echo "Desktop shortcut:     $MAIN_HOME/AI"
 echo "Runtime:              rootless Podman (daemonless)"
 echo "GPU:                  NVIDIA CDI"
@@ -1186,7 +1211,7 @@ echo "IMPORTANT:"
 echo "  Anything under ~/AI is intentionally available to the agent and may"
 echo "  be uploaded to the Internet. Keep credentials and secrets outside it."
 
-if ! root find "$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
+if ! root find "$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q .; then
   echo
   warn "No model installed. Add one with: ai-model add /path/to/model.gguf"
 fi
