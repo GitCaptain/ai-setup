@@ -30,7 +30,8 @@ AI_SLICE_MEM="25G"
 AI_SLICE_CPU="2400%"
 VRAM_RESERVE_MIB=2048
 
-MODEL_PATH=""
+INITIAL_MODELS=()
+MODELS_MAX=1
 EXA_API_KEY=""
 WEB_SEARCH_PRIMARY="auto"
 WEB_SEARCH_FALLBACK="duckduckgo"
@@ -56,7 +57,8 @@ Normal usage:
 
 Options (override config):
   --config PATH
-  --model PATH
+  --model PATH            Import a GGUF file/bundle (repeatable)
+  --models-max N          Max simultaneously loaded router models
   --ctx TOKENS
   --vram-reserve MIB
   --llama-memory SIZE
@@ -141,7 +143,8 @@ set_config_key() {
     SHARE_GROUP) SHARE_GROUP="$value" ;;
     WORKSPACE) WORKSPACE="$value" ;;
 
-    MODEL_PATH) MODEL_PATH="$value" ;;
+    MODEL|MODEL_PATH) [[ -n "$value" ]] && INITIAL_MODELS+=("$value") ;;
+    MODELS_MAX) MODELS_MAX="$value" ;;
     LLAMA_IMAGE) LLAMA_IMAGE="$value" ;;
     LLAMA_PORT) LLAMA_PORT="$value" ;;
     LLAMA_CTX) LLAMA_CTX="$value" ;;
@@ -215,7 +218,8 @@ while (($#)); do
   case "$1" in
     --config)           shift 2 ;;
     --config=*)         shift ;;
-    --model)            MODEL_PATH="${2:?missing value}"; shift 2 ;;
+    --model)            INITIAL_MODELS+=("${2:?missing value}"); shift 2 ;;
+    --models-max)       MODELS_MAX="${2:?missing value}"; shift 2 ;;
     --ctx)              LLAMA_CTX="${2:?missing value}"; shift 2 ;;
     --vram-reserve)     VRAM_RESERVE_MIB="${2:?missing value}"; shift 2 ;;
     --llama-memory)     LLAMA_MEM="${2:?missing value}"; shift 2 ;;
@@ -236,10 +240,6 @@ done
 
 HARDEN_HOME="$(bool_to_int "$HARDEN_HOME")"
 ASSUME_YES="$(bool_to_int "$ASSUME_YES")"
-
-if [[ "$MODEL_PATH" == "~/"* ]]; then
-  MODEL_PATH="$MAIN_HOME/${MODEL_PATH#~/}"
-fi
 
 case "${WEB_SEARCH_PRIMARY,,}" in
   auto)
@@ -275,18 +275,25 @@ fi
 source /etc/os-release
 [[ "${ID:-}" == arch ]] || die "This installer currently targets Arch Linux."
 
-[[ "$LLAMA_CTX" =~ ^[0-9]+$ ]] && (( LLAMA_CTX >= 1024 )) || die "--ctx must be >= 1024"
-[[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "--vram-reserve must be integer MiB"
-[[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] && (( LLAMA_PORT >= 1024 && LLAMA_PORT <= 65535 )) || die "Invalid --llama-port"
-[[ "$AI_SLICE_CPU" =~ ^[0-9]+%$ ]] || die "--ai-cpu must look like 2400%"
+[[ "$LLAMA_CTX" =~ ^[0-9]+$ ]] && (( LLAMA_CTX >= 1024 )) || die "LLAMA_CTX/--ctx must be >= 1024"
+[[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB/--vram-reserve must be integer MiB"
+[[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] && (( LLAMA_PORT >= 1024 && LLAMA_PORT <= 65535 )) || die "Invalid LLAMA_PORT/--llama-port"
+[[ "$AI_SLICE_CPU" =~ ^[0-9]+%$ ]] || die "AI_SLICE_CPU/--ai-cpu must look like 2400%"
+[[ "$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || die "MODELS_MAX/--models-max must be >= 1"
 
-if [[ -n "$MODEL_PATH" ]]; then
-  MODEL_PATH="$(realpath -e "$MODEL_PATH")"
-  [[ -f "$MODEL_PATH" ]] || die "--model must be a regular file"
-  as_main test -r "$MODEL_PATH" || die "Model is not readable by $MAIN_USER"
-  magic="$(as_main head -c4 "$MODEL_PATH" 2>/dev/null || true)"
-  [[ "$magic" == "GGUF" ]] || die "Model does not start with GGUF magic"
-fi
+# Resolve MODEL= entries. Files are imported later, after the isolated model store exists.
+resolved_models=()
+for src in "${INITIAL_MODELS[@]}"; do
+  [[ -n "$src" ]] || continue
+  if [[ "$src" == "~/"* ]]; then
+    src="$MAIN_HOME/${src#~/}"
+  fi
+  src="$(realpath -e "$src")" || die "Initial model path does not exist: $src"
+  as_main test -r "$src" || die "Initial model path is not readable by $MAIN_USER: $src"
+  [[ -f "$src" || -d "$src" ]] || die "MODEL must be a GGUF file or model-bundle directory: $src"
+  resolved_models+=("$src")
+done
+INITIAL_MODELS=("${resolved_models[@]}")
 
 log "Installing required Arch packages..."
 root pacman -S --needed --noconfirm \
@@ -453,16 +460,59 @@ else
   root rm -f "$SECRET_ENV"
 fi
 
-if [[ -n "$MODEL_PATH" ]]; then
-  log "Installing/replacing GGUF model..."
-  tmp="$AI_HOME/models/.model.gguf.new"
-  root rm -f "$tmp"
-  root cp --reflink=auto --sparse=always "$MODEL_PATH" "$tmp"
-  root chown root:"$AI_GID" "$tmp"
-  root chmod 0440 "$tmp"
-  root mv -f "$tmp" "$AI_HOME/models/model.gguf"
-elif [[ ! -r "$AI_HOME/models/model.gguf" ]]; then
-  warn "No model installed yet. Re-run later with --model /path/model.gguf"
+validate_model_source() {
+  local src="$1" f found=0
+  as_main test -r "$src" || die "Model source is not readable by $MAIN_USER: $src"
+  if [[ -f "$src" ]]; then
+    [[ "${src,,}" == *.gguf ]] || die "Model file must end in .gguf: $src"
+    [[ "$(as_main head -c4 "$src" 2>/dev/null || true)" == "GGUF" ]] || die "Invalid GGUF header: $src"
+    return
+  fi
+  [[ -d "$src" ]] || die "Model source must be file or directory: $src"
+  if find "$src" -type l -print -quit | grep -q .; then
+    die "Model bundle must not contain symlinks: $src"
+  fi
+  while IFS= read -r -d '' f; do
+    found=1
+    as_main test -r "$f" || die "Unreadable model file in bundle: $f"
+    [[ "$(as_main head -c4 "$f" 2>/dev/null || true)" == "GGUF" ]] || die "Invalid GGUF header: $f"
+  done < <(find "$src" -type f -iname '*.gguf' -print0)
+  (( found )) || die "Model bundle contains no .gguf files: $src"
+}
+
+install_model_source() {
+  local src="$1" name dest tmp
+  validate_model_source "$src"
+  name="$(basename "$src")"
+  dest="$AI_HOME/models/$name"
+  if [[ -e "$dest" ]]; then
+    log "Model already present, skipping: $name"
+    return
+  fi
+  tmp="$AI_HOME/models/.import-${name}.$$"
+  root rm -rf -- "$tmp"
+  log "Importing model: $src -> $dest"
+  if [[ -f "$src" ]]; then
+    root cp --reflink=auto --sparse=always -- "$src" "$tmp"
+  else
+    root cp -a --reflink=auto -- "$src" "$tmp"
+  fi
+  root chown -R root:"$AI_GID" "$tmp"
+  if [[ -d "$tmp" ]]; then
+    root find "$tmp" -type d -exec chmod 0550 {} +
+    root find "$tmp" -type f -exec chmod 0440 {} +
+  else
+    root chmod 0440 "$tmp"
+  fi
+  root mv -- "$tmp" "$dest"
+}
+
+for src in "${INITIAL_MODELS[@]}"; do
+  install_model_source "$src"
+done
+
+if ! root find "$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
+  warn "No models installed yet. Use: ai-model add /path/to/model.gguf"
 fi
 
 # OMP config.
@@ -488,7 +538,6 @@ computer:
   enabled: false
 
 modelRoles:
-  default: llama.cpp/local-ai
   web: $WEB_PRIMARY_SELECTOR
 
 retry:
@@ -506,19 +555,9 @@ else
 EOF
 fi
 
-# Explicit provider makes discovery deterministic inside the container network.
-root tee "$AI_HOME/state/.omp/agent/models.yml" >/dev/null <<EOF
-providers:
-  llama.cpp:
-    baseUrl: http://llama:8080
-    api: openai-responses
-    auth: none
-    models:
-      - id: local-ai
-        name: Local AI
-        contextWindow: $LLAMA_CTX
-        maxTokens: $OMP_MAX_TOKENS
-EOF
+# Use OMP's implicit llama.cpp provider so runtime discovery sees every router model.
+# Remove the old single-model provider file if upgrading from v1.
+root rm -f "$AI_HOME/state/.omp/agent/models.yml"
 
 root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
 root chmod -R go-rwx "$AI_HOME/state"
@@ -622,6 +661,7 @@ LLAMA_CTX="$LLAMA_CTX"
 LLAMA_MEM="$LLAMA_MEM"
 OMP_MEM="$OMP_MEM"
 VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"
+MODELS_MAX="$MODELS_MAX"
 AI_UID="$AI_UID"
 SECRET_ENV="$AI_HOME/secrets/omp.env"
 
@@ -688,11 +728,11 @@ if [[ "\$candidate" != "\$WORKSPACE" ]]; then
   container_workdir="/workspace/\${candidate#"\$WORKSPACE/"}"
 fi
 
-[[ -r "\$AI_HOME/models/model.gguf" ]] || {
-  echo "No GGUF model installed." >&2
-  echo "Re-run setup with --model /path/to/model.gguf" >&2
+if ! find "\$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
+  echo "No GGUF models installed." >&2
+  echo "Use: ai-model add /path/to/model.gguf" >&2
   exit 3
-}
+fi
 
 # Only one interactive AI session at a time.
 exec 9>"\$XDG_RUNTIME_DIR/omp-ai.session.lock"
@@ -707,7 +747,7 @@ trap cleanup EXIT INT TERM HUP
 # Remove stale containers from a crashed previous run.
 podman rm -f "\$OMP_NAME" "\$LLAMA_NAME" >/dev/null 2>&1 || true
 
-echo "[omp-ai] Loading model into RAM/VRAM..."
+echo "[omp-ai] Starting llama.cpp model router..."
 
 podman run -d \
   --name "\$LLAMA_NAME" \
@@ -725,8 +765,9 @@ podman run -d \
   --mount "type=bind,src=\$AI_HOME/models,dst=/models,ro=true,bind-nonrecursive" \
   -p "127.0.0.1:\$LLAMA_PORT:8080" \
   "\$LLAMA_IMAGE" \
-    --model /models/model.gguf \
-    --alias local-ai \
+    --models-dir /models \
+    --models-max "\$MODELS_MAX" \
+    --models-autoload \
     --host 0.0.0.0 \
     --port 8080 \
     --ctx-size "\$LLAMA_CTX" \
@@ -760,8 +801,15 @@ if (( ! ready )); then
   exit 5
 fi
 
-echo "[omp-ai] Model ready. OMP only sees /workspace."
-echo "[omp-ai] Exit OMP to unload RAM/VRAM."
+catalog="\$(curl -fsS "http://127.0.0.1:\$LLAMA_PORT/v1/models" 2>/dev/null || true)"
+if ! grep -q '"id"' <<<"\$catalog"; then
+  echo "[omp-ai] Router is healthy but exposes no models. Check: ai-model list" >&2
+  exit 6
+fi
+
+echo "[omp-ai] Router ready. Models are loaded into RAM/VRAM only when selected/used."
+echo "[omp-ai] Use /model inside OMP to switch models. At most \$MODELS_MAX model(s) stay loaded."
+echo "[omp-ai] Exit OMP to remove the router and release all model RAM/VRAM."
 
 secret_args=()
 if [[ -r "$SECRET_ENV" ]]; then
@@ -866,11 +914,170 @@ EOF
 root chmod 0755 "$GIVE"
 root chown root:root "$GIVE"
 
+# Root-owned model-store helper. It only imports sources readable by the desktop
+# user, validates GGUF content, and never exposes arbitrary root-readable files.
+MODEL_INNER="/usr/local/libexec/omp-ai-model-inner"
+root tee "$MODEL_INNER" >/dev/null <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+AI_USER="$AI_USER"
+MAIN_USER="$MAIN_USER"
+AI_HOME="$AI_HOME"
+AI_UID="$AI_UID"
+AI_GID="$AI_GID"
+MODELS_DIR="$AI_HOME/models"
+
+[[ "\$(id -u)" -eq 0 ]] || { echo "model helper must run as root" >&2; exit 1; }
+
+as_main() {
+  runuser -u "\$MAIN_USER" -- env HOME="$MAIN_HOME" USER="\$MAIN_USER" LOGNAME="\$MAIN_USER" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin "\$@"
+}
+
+as_ai() {
+  runuser -u "\$AI_USER" -- env HOME="\$AI_HOME" USER="\$AI_USER" LOGNAME="\$AI_USER" \
+    XDG_RUNTIME_DIR="/run/user/\$AI_UID" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin "\$@"
+}
+
+require_idle() {
+  if as_ai podman ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^ompai-(agent|llama)$'; then
+    echo "An omp-ai session is active. Exit it (or run: omp-ai stop) before changing models." >&2
+    exit 3
+  fi
+}
+
+resolve_source() {
+  local src="\$1"
+  if [[ "\$src" == "~/"* ]]; then src="$MAIN_HOME/\${src#~/}"; fi
+  realpath -e -- "\$src"
+}
+
+validate_source() {
+  local src="\$1" f found=0
+  as_main test -r "\$src" || { echo "Not readable by $MAIN_USER: \$src" >&2; return 1; }
+  if [[ -f "\$src" ]]; then
+    [[ "\${src,,}" == *.gguf ]] || { echo "Model file must end in .gguf: \$src" >&2; return 1; }
+    [[ "\$(as_main head -c4 "\$src" 2>/dev/null || true)" == GGUF ]] || { echo "Invalid GGUF: \$src" >&2; return 1; }
+    return 0
+  fi
+  [[ -d "\$src" ]] || { echo "Expected GGUF file or model directory: \$src" >&2; return 1; }
+  if find "\$src" -type l -print -quit | grep -q .; then
+    echo "Model directories containing symlinks are rejected: \$src" >&2
+    return 1
+  fi
+  while IFS= read -r -d '' f; do
+    found=1
+    as_main test -r "\$f" || { echo "Unreadable GGUF in bundle: \$f" >&2; return 1; }
+    [[ "\$(as_main head -c4 "\$f" 2>/dev/null || true)" == GGUF ]] || { echo "Invalid GGUF: \$f" >&2; return 1; }
+  done < <(find "\$src" -type f -iname '*.gguf' -print0)
+  (( found )) || { echo "No .gguf files found in: \$src" >&2; return 1; }
+}
+
+install_one() {
+  local mode="\$1" raw="\$2" src name dest tmp
+  src="\$(resolve_source "\$raw")" || { echo "Path does not exist: \$raw" >&2; return 1; }
+  validate_source "\$src"
+  name="\$(basename "\$src")"
+  [[ "\$name" != .* ]] || { echo "Refusing hidden model-store entry: \$name" >&2; return 1; }
+  dest="\$MODELS_DIR/\$name"
+
+  if [[ -e "\$dest" ]]; then
+    if [[ "\$mode" == add ]]; then
+      echo "Already exists: \$name (use: ai-model replace \\"\$src\\")" >&2
+      return 1
+    fi
+    rm -rf -- "\$dest"
+  fi
+
+  tmp="\$MODELS_DIR/.import-\${name}.\$\$"
+  rm -rf -- "\$tmp"
+  trap 'rm -rf -- "\$tmp"' RETURN
+
+  if [[ -f "\$src" ]]; then
+    cp --reflink=auto --sparse=always -- "\$src" "\$tmp"
+  else
+    cp -a --reflink=auto -- "\$src" "\$tmp"
+  fi
+  chown -R root:"\$AI_GID" "\$tmp"
+  if [[ -d "\$tmp" ]]; then
+    find "\$tmp" -type d -exec chmod 0550 {} +
+    find "\$tmp" -type f -exec chmod 0440 {} +
+  else
+    chmod 0440 "\$tmp"
+  fi
+  mv -- "\$tmp" "\$dest"
+  trap - RETURN
+  echo "Installed: \$name"
+}
+
+cmd="\${1:-help}"; shift || true
+case "\$cmd" in
+  add|replace)
+    (( \$# > 0 )) || { echo "Usage: ai-model \$cmd FILE_OR_DIR [...]" >&2; exit 2; }
+    require_idle
+    for src in "\$@"; do install_one "\$cmd" "\$src"; done
+    ;;
+  remove|rm)
+    (( \$# > 0 )) || { echo "Usage: ai-model remove NAME [...]" >&2; exit 2; }
+    require_idle
+    for name in "\$@"; do
+      [[ "\$name" != */* && "\$name" != . && "\$name" != .. && -n "\$name" ]] || { echo "Invalid model name: \$name" >&2; exit 2; }
+      target="\$MODELS_DIR/\$name"
+      [[ -e "\$target" ]] || { echo "Not found: \$name" >&2; continue; }
+      rm -rf -- "\$target"
+      echo "Removed: \$name"
+    done
+    ;;
+  list|ls)
+    printf '%-46s %10s  %s\\n' NAME SIZE TYPE
+    while IFS= read -r -d '' entry; do
+      name="\$(basename "\$entry")"
+      size="\$(du -sh -- "\$entry" | awk '{print \$1}')"
+      if [[ -d "\$entry" ]]; then kind=bundle; else kind=gguf; fi
+      printf '%-46s %10s  %s\\n' "\$name" "\$size" "\$kind"
+    done < <(find "\$MODELS_DIR" -mindepth 1 -maxdepth 1 ! -name '.import-*' -print0 | sort -z)
+    ;;
+  path)
+    echo "\$MODELS_DIR"
+    ;;
+  help|-h|--help)
+    cat <<'HELP'
+Usage:
+  ai-model add FILE_OR_DIR [...]
+  ai-model replace FILE_OR_DIR [...]
+  ai-model remove NAME [...]
+  ai-model list
+  ai-model path
+
+A FILE must be GGUF. A DIR is treated as one llama.cpp model bundle and may
+contain sharded GGUF files and/or mmproj*.gguf. Changes are allowed only while
+omp-ai is stopped; the next omp-ai launch rescans --models-dir.
+HELP
+    ;;
+  *) echo "Unknown command: \$cmd" >&2; exit 2 ;;
+esac
+EOF
+root chmod 0755 "$MODEL_INNER"
+root chown root:root "$MODEL_INNER"
+
+MODEL_PUBLIC="/usr/local/bin/ai-model"
+root tee "$MODEL_PUBLIC" >/dev/null <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec sudo -n "$MODEL_INNER" "\$@"
+EOF
+root chmod 0755 "$MODEL_PUBLIC"
+root chown root:root "$MODEL_PUBLIC"
+
 # Narrow sudo permission: the desktop user can become ompai only for this one
 # root-owned helper, not for an arbitrary shell.
 SUDOERS="/etc/sudoers.d/omp-ai"
 root tee "$SUDOERS" >/dev/null <<EOF
 $MAIN_USER ALL=($AI_USER) NOPASSWD: $INNER *
+$MAIN_USER ALL=(root) NOPASSWD: $MODEL_INNER *
 EOF
 root chmod 0440 "$SUDOERS"
 root visudo -cf "$SUDOERS" >/dev/null
@@ -951,10 +1158,11 @@ echo "Workspace:            $WORKSPACE"
 echo "Desktop shortcut:     $MAIN_HOME/AI"
 echo "Runtime:              rootless Podman (daemonless)"
 echo "GPU:                  NVIDIA CDI"
-echo "Model lifecycle:      on-demand; unloaded when OMP exits"
+echo "Model lifecycle:      router on-demand; selected model autoloaded"
 echo "Host-user hard cap:   RAM=$AI_SLICE_MEM, CPU=$AI_SLICE_CPU, swap=0"
 echo "llama container cap:  $LLAMA_MEM"
 echo "OMP container cap:    $OMP_MEM"
+echo "Router models max:    $MODELS_MAX"
 echo "VRAM reserve target:  ${VRAM_RESERVE_MIB} MiB"
 echo "Web search primary:   $WEB_SEARCH_PRIMARY"
 echo "Web search fallback:  ${WEB_SEARCH_FALLBACK:-none}"
@@ -965,6 +1173,8 @@ else
 fi
 echo
 echo "Use:"
+echo "  ai-model add ~/Downloads/model.gguf"
+echo "  ai-model list"
 echo "  ai-give ~/Downloads/document.pdf"
 echo "  cd ~/AI && omp-ai"
 echo "  cd ~/AI/my-project && omp-ai"
@@ -976,8 +1186,7 @@ echo "IMPORTANT:"
 echo "  Anything under ~/AI is intentionally available to the agent and may"
 echo "  be uploaded to the Internet. Keep credentials and secrets outside it."
 
-if [[ ! -r "$AI_HOME/models/model.gguf" ]]; then
+if ! root find "$AI_HOME/models" -type f -iname '*.gguf' -print -quit | grep -q .; then
   echo
-  warn "No model installed. Re-run with:"
-  echo "  $0 --model /path/to/model.gguf"
+  warn "No model installed. Add one with: ai-model add /path/to/model.gguf"
 fi
