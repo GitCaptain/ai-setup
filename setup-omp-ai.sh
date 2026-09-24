@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # - rootless/daemonless Podman
 # - NVIDIA CDI
 # - OMP in a hardened container
-# - llama.cpp multi-model router, loaded only on demand
+# - one shared llama.cpp multi-model router for concurrent OMP sessions
 # - persistent configurable model store
 # - persistent ~/AI workspace
 # - temporary direct --share / --share-ro mounts
@@ -31,6 +31,7 @@ OMP_REF="main"
 MODELS_MAX=1
 LLAMA_PORT=18080
 LLAMA_CTX=8192
+LLAMA_PARALLEL=1
 LLAMA_MEM="22g"
 OMP_MEM="3g"
 AI_SLICE_MEM="25G"
@@ -66,6 +67,7 @@ Overrides:
   --model-store PATH
   --models-max N
   --ctx N
+  --llama-parallel N
   --vram-reserve MIB
   --llama-memory SIZE
   --omp-memory SIZE
@@ -146,6 +148,7 @@ set_cfg() {
     LLAMA_IMAGE) LLAMA_IMAGE="$v";;
     LLAMA_PORT) LLAMA_PORT="$v";;
     LLAMA_CTX) LLAMA_CTX="$v";;
+    LLAMA_PARALLEL) LLAMA_PARALLEL="$v";;
     LLAMA_MEM) LLAMA_MEM="$v";;
     VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";;
 
@@ -197,6 +200,7 @@ while (($#)); do
     --model-store) MODEL_STORE="${2:?}"; shift 2;;
     --models-max) MODELS_MAX="${2:?}"; shift 2;;
     --ctx) LLAMA_CTX="${2:?}"; shift 2;;
+    --llama-parallel) LLAMA_PARALLEL="${2:?}"; shift 2;;
     --vram-reserve) VRAM_RESERVE_MIB="${2:?}"; shift 2;;
     --llama-memory) LLAMA_MEM="${2:?}"; shift 2;;
     --omp-memory) OMP_MEM="${2:?}"; shift 2;;
@@ -221,6 +225,7 @@ esac
 [[ "$WORKSPACE" = /* && "$WORKSPACE" != / ]] || die "WORKSPACE must be an absolute non-root path"
 [[ "$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || die "MODELS_MAX must be >= 1"
 [[ "$LLAMA_CTX" =~ ^[0-9]+$ ]] && (( LLAMA_CTX >= 1024 )) || die "LLAMA_CTX must be >= 1024"
+[[ "$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || die "LLAMA_PARALLEL must be >= 1"
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
 [[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] || die "LLAMA_PORT must be an integer"
 
@@ -477,6 +482,8 @@ STAGE="$SHARE_STAGE"
 [[ \$EUID -eq 0 ]] || { echo "Must run as root" >&2; exit 1; }
 valid_sid(){ [[ "\$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 sdir(){ valid_sid "\$1" || exit 2; printf '%s/%s' "\$STATE" "\$1"; }
+exec 9>"\$STATE/.lock"
+flock 9
 
 cleanup_one() {
   local sid="\$1" d item src mnt before after
@@ -521,6 +528,9 @@ case "\${1:-}" in
     install -d -o root -g root -m 0700 "\$STATE/\$sid"
     install -d -o root -g root -m 0711 "\$STAGE/\$sid"
     date +%s >"\$STATE/\$sid/started"
+    date +%s >"\$STATE/\$sid/heartbeat"
+    echo 0 >"\$STATE/\$sid/owner_pid"
+    echo 0 >"\$STATE/\$sid/owner_start"
     cat /proc/sys/kernel/random/boot_id >"\$STATE/\$sid/boot_id"
     echo 0 >"\$STATE/\$sid/count"
     : >"\$STATE/\$sid/mounts"
@@ -535,6 +545,20 @@ case "\${1:-}" in
     [[ -f "\$src" || -d "\$src" ]] || { echo "Only files/directories can be shared" >&2; exit 2; }
     [[ "\$src" != "/" && "\$src" != "$MAIN_HOME" ]] || { echo "Refusing overly broad share" >&2; exit 2; }
     case "\$src" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*) echo "Refusing pseudo-filesystem" >&2; exit 2;; esac
+
+    # Overlapping direct shares are refused. Otherwise one session could restore
+    # ACLs while another session still relies on them. Separate projects/files
+    # can be shared concurrently without this ambiguity.
+    shopt -s nullglob
+    for source_file in "\$STATE"/*/item-*/source; do
+      other="\$(cat "\$source_file" 2>/dev/null || true)"
+      [[ -n "\$other" ]] || continue
+      if [[ "\$src" == "\$other" || "\$src" == "\$other"/* || "\$other" == "\$src"/* ]]; then
+        echo "Direct share overlaps an active share: \$other" >&2
+        exit 4
+      fi
+    done
+    shopt -u nullglob
 
     # User must already own/have the requested access. We do not use this helper
     # to grant the desktop user new access to root/system files.
@@ -560,10 +584,14 @@ case "\${1:-}" in
       if [[ "\$mode" == ro ]]; then
         find -P "\$src" -type d -print0 | xargs -0 -r setfacl -m "u:\$AI_USER:r-x" --
         find -P "\$src" -type f -print0 | xargs -0 -r setfacl -m "u:\$AI_USER:r--" --
+        runuser -u "\$MAIN_USER" -- find -P "\$src" -type f -executable -print0 |
+          xargs -0 -r setfacl -m "u:\$AI_USER:r-x" --
       else
         find -P "\$src" -type d -print0 |
           xargs -0 -r setfacl -m "u:\$AI_USER:rwx" -m "d:u:\$AI_USER:rwx" -m "d:u:\$MAIN_USER:rwx" --
         find -P "\$src" -type f -print0 | xargs -0 -r setfacl -m "u:\$AI_USER:rw-" --
+        runuser -u "\$MAIN_USER" -- find -P "\$src" -type f -executable -print0 |
+          xargs -0 -r setfacl -m "u:\$AI_USER:rwx" --
       fi
     else
       [[ "\$mode" == ro ]] && perms=r-- || perms=rw-
@@ -581,21 +609,40 @@ case "\${1:-}" in
     printf '%s\n' "\$mnt" >>"\$d/mounts"
     printf '%s\n' "\$mnt"
     ;;
+  attach)
+    sid="\${2:?}"; pid="\${3:?}"; start="\${4:?}"; d="\$(sdir "\$sid")"
+    [[ -d "\$d" && "\$pid" =~ ^[0-9]+$ && "\$start" =~ ^[0-9]+$ ]] || exit 2
+    current="\$(awk '{print \$22}' "/proc/\$pid/stat" 2>/dev/null || true)"
+    [[ "\$current" == "\$start" ]] || { echo "Share owner process is no longer alive" >&2; exit 3; }
+    printf '%s\n' "\$pid" >"\$d/owner_pid"
+    printf '%s\n' "\$start" >"\$d/owner_start"
+    date +%s >"\$d/heartbeat"
+    ;;
+  heartbeat)
+    sid="\${2:?}"; d="\$(sdir "\$sid")"
+    [[ -d "\$d" ]] || exit 2
+    date +%s >"\$d/heartbeat"
+    ;;
   cleanup)
     cleanup_one "\${2:?}"
     ;;
   cleanup-stale)
-    age="\${2:-600}"; now="\$(date +%s)"; boot="\$(cat /proc/sys/kernel/random/boot_id)"
+    age="\${2:-180}"; now="\$(date +%s)"; boot="\$(cat /proc/sys/kernel/random/boot_id)"
     shopt -s nullglob
     for d in "\$STATE"/*; do
       [[ -d "\$d" ]] || continue
       sid="\$(basename "\$d")"
-      started="\$(cat "\$d/started" 2>/dev/null || echo 0)"
+      heartbeat="\$(cat "\$d/heartbeat" 2>/dev/null || cat "\$d/started" 2>/dev/null || echo 0)"
       oldboot="\$(cat "\$d/boot_id" 2>/dev/null || true)"
-      if [[ "\$oldboot" != "\$boot" ]] || (( now-started >= age )); then cleanup_one "\$sid"; fi
+      owner_pid="\$(cat "\$d/owner_pid" 2>/dev/null || echo 0)"
+      owner_start="\$(cat "\$d/owner_start" 2>/dev/null || echo 0)"
+      current_start="\$(awk '{print \$22}' "/proc/\$owner_pid/stat" 2>/dev/null || true)"
+      live=0
+      [[ "\$owner_pid" != 0 && -n "\$current_start" && "\$current_start" == "\$owner_start" ]] && live=1
+      if [[ "\$oldboot" != "\$boot" ]] || (( ! live && now-heartbeat >= age )); then cleanup_one "\$sid"; fi
     done
     ;;
-  *) echo "Usage: omp-ai-share {begin|grant SID rw|ro PATH|cleanup SID|cleanup-stale [SECONDS]}" >&2; exit 2;;
+  *) echo "Usage: omp-ai-share {begin|grant SID rw|ro PATH|attach SID PID START|heartbeat SID|cleanup SID|cleanup-stale [SECONDS]}" >&2; exit 2;;
 esac
 EOF
 root chmod 0755 "$SHARE_HELPER"
@@ -612,12 +659,14 @@ MODEL_STORE="$MODEL_STORE"
 LLAMA_IMAGE="$LLAMA_IMAGE"
 LLAMA_PORT="$LLAMA_PORT"
 LLAMA_CTX="$LLAMA_CTX"
+LLAMA_PARALLEL="$LLAMA_PARALLEL"
 LLAMA_MEM="$LLAMA_MEM"
 OMP_MEM="$OMP_MEM"
 VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"
 MODELS_MAX="$MODELS_MAX"
 AI_UID="$AI_UID"
 SECRET_ENV="$SECRET_ENV"
+SHARE_STAGE="$SHARE_STAGE"
 
 export HOME="\$AI_HOME"
 export XDG_RUNTIME_DIR="/run/user/\$AI_UID"
@@ -626,13 +675,118 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
 export TERM="\${TERM:-xterm-256color}"
 
 LLAMA_NAME=ompai-llama
-OMP_NAME=ompai-agent
-LEASE="\$XDG_RUNTIME_DIR/omp-ai.lease"
+SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"
+ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"
+mkdir -p "\$SESS_DIR"
+chmod 0700 "\$SESS_DIR"
+
+with_router_lock() {
+  exec 8>"\$ROUTER_LOCK"
+  flock 8
+}
+release_router_lock() {
+  flock -u 8 || true
+  exec 8>&-
+}
+marker_count() {
+  local markers=()
+  shopt -s nullglob
+  markers=("\$SESS_DIR"/*.session)
+  shopt -u nullglob
+  (( \${#markers[@]} > 0 ))
+}
+stop_router_if_unused_locked() {
+  if ! marker_count; then
+    podman rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+  fi
+}
+router_healthy() {
+  local body
+  body="\$(curl -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null || true)"
+  grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"\$body"
+}
+start_router_locked() {
+  if [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && router_healthy; then
+    return 0
+  fi
+
+  podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+  echo "[omp-ai] Starting shared llama.cpp router..."
+  podman run -d --name "\$LLAMA_NAME" --replace \
+    --network omp-llm --network-alias llama \
+    --device nvidia.com/gpu=all \
+    --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 \
+    --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+    --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" \
+    -p "127.0.0.1:\$LLAMA_PORT:8080" \
+    "\$LLAMA_IMAGE" \
+      --models-dir /models --models-max "\$MODELS_MAX" --models-autoload \
+      --host 0.0.0.0 --port 8080 \
+      --ctx-size "\$LLAMA_CTX" --parallel "\$LLAMA_PARALLEL" \
+      --cache-type-k q8_0 --cache-type-v q8_0 \
+      --flash-attn auto --fit on --fit-target "\$VRAM_RESERVE_MIB" \
+      --offline >/dev/null
+
+  for _ in \$(seq 1 300); do
+    router_healthy && return 0
+    [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break
+    sleep 1
+  done
+  podman logs --tail=120 "\$LLAMA_NAME" >&2 || true
+  return 1
+}
 
 case "\${1:-}" in
-  stop) podman rm -f -t 5 "\$OMP_NAME" "\$LLAMA_NAME" >/dev/null 2>&1 || true; rm -f "\$LEASE"; exit 0;;
-  status) podman ps -a --filter "name=^\${OMP_NAME}$" --filter "name=^\${LLAMA_NAME}$"; exit 0;;
-  logs) shift; exec podman logs -f "\$LLAMA_NAME";;
+  stop)
+    with_router_lock
+    mapfile -t agents < <(podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
+    (( \${#agents[@]} )) && podman rm -f -t 5 "\${agents[@]}" >/dev/null 2>&1 || true
+    rm -f "\$SESS_DIR"/*.session 2>/dev/null || true
+    podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+    release_router_lock
+    exit 0
+    ;;
+  status)
+    podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|agent-)' || true; }
+    exit 0
+    ;;
+  logs)
+    shift
+    exec podman logs -f "\$LLAMA_NAME"
+    ;;
+  reap)
+    age="\${2:-120}"
+    now="\$(date +%s)"
+    with_router_lock
+    shopt -s nullglob
+    for marker in "\$SESS_DIR"/*.session; do
+      mt="\$(stat -c %Y "\$marker" 2>/dev/null || echo 0)"
+      agent="\$(sed -n '1p' "\$marker" 2>/dev/null || true)"
+      owner_pid="\$(sed -n '2p' "\$marker" 2>/dev/null || echo 0)"
+      owner_start="\$(sed -n '3p' "\$marker" 2>/dev/null || echo 0)"
+      current_start="\$(awk '{print \$22}' "/proc/\$owner_pid/stat" 2>/dev/null || true)"
+      live=0
+      [[ "\$owner_pid" != 0 && -n "\$current_start" && "\$current_start" == "\$owner_start" ]] && live=1
+      if (( ! live && now-mt >= age )); then
+        [[ -n "\$agent" ]] && podman rm -f -t 5 "\$agent" >/dev/null 2>&1 || true
+        rm -f "\$marker"
+      fi
+    done
+
+    # Remove orphaned agent containers for which no live session marker exists.
+    mapfile -t known < <(for m in "\$SESS_DIR"/*.session; do head -n1 "\$m" 2>/dev/null || true; done)
+    mapfile -t agents < <(podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
+    for agent in "\${agents[@]}"; do
+      keep=0
+      for known_agent in "\${known[@]}"; do [[ "\$agent" == "\$known_agent" ]] && { keep=1; break; }; done
+      (( keep )) || podman rm -f -t 5 "\$agent" >/dev/null 2>&1 || true
+    done
+    shopt -u nullglob
+    stop_router_if_unused_locked
+    release_router_lock
+    exit 0
+    ;;
 esac
 
 workdir_rel=""
@@ -660,7 +814,7 @@ declare -A used=()
 first_share_dir=""
 for i in "\${!share_sources[@]}"; do
   src="\$(realpath -e -- "\${share_sources[\$i]}")"
-  case "\$src" in "$SHARE_STAGE"/*) ;; *) echo "Invalid staged share path" >&2; exit 2;; esac
+  case "\$src" in "\$SHARE_STAGE"/*) ;; *) echo "Invalid staged share path" >&2; exit 2;; esac
   base="\$(basename -- "\$src" | sed 's/^[0-9][0-9][0-9][0-9]-//')"
   name="\$base"; n=2
   while [[ -n "\${used[\$name]:-}" ]]; do name="\${base}-\$n"; ((n++)); done
@@ -678,51 +832,47 @@ done
 find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q . ||
   { echo "No models. Use: ai-model add /path/model.gguf" >&2; exit 3; }
 
-exec 9>"\$XDG_RUNTIME_DIR/omp-ai.session.lock"
-flock -n 9 || { echo "Another omp-ai session is active" >&2; exit 4; }
-touch "\$LEASE"
+SESSION_ID="\$(cat /proc/sys/kernel/random/uuid)"
+OMP_NAME="ompai-agent-\$SESSION_ID"
+MARKER="\$SESS_DIR/\$SESSION_ID.session"
+HB_PID=""
 
 cleanup(){
   rc=\$?
   trap - EXIT INT TERM HUP
-  podman rm -f -t 10 "\$OMP_NAME" "\$LLAMA_NAME" >/dev/null 2>&1 || true
-  rm -f "\$LEASE"
+  [[ -n "\$HB_PID" ]] && kill "\$HB_PID" >/dev/null 2>&1 || true
+  podman rm -f -t 10 "\$OMP_NAME" >/dev/null 2>&1 || true
+  with_router_lock
+  rm -f "\$MARKER"
+  stop_router_if_unused_locked
+  release_router_lock
   exit "\$rc"
 }
 trap cleanup EXIT INT TERM HUP
 
-podman rm -f "\$OMP_NAME" "\$LLAMA_NAME" >/dev/null 2>&1 || true
-echo "[omp-ai] Starting llama.cpp router..."
-podman run -d --name "\$LLAMA_NAME" --replace \
-  --network omp-llm --network-alias llama \
-  --device nvidia.com/gpu=all \
-  --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 \
-  --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --tmpfs /tmp:rw,nosuid,nodev,size=512m \
-  --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" \
-  -p "127.0.0.1:\$LLAMA_PORT:8080" \
-  "\$LLAMA_IMAGE" \
-    --models-dir /models --models-max "\$MODELS_MAX" --models-autoload \
-    --host 0.0.0.0 --port 8080 \
-    --ctx-size "\$LLAMA_CTX" \
-    --cache-type-k q8_0 --cache-type-v q8_0 \
-    --parallel 1 --flash-attn auto --fit on --fit-target "\$VRAM_RESERVE_MIB" \
-    --offline >/dev/null
+with_router_lock
+start_router_locked || { release_router_lock; exit 5; }
+proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"
+printf '%s\n%s\n%s\n' "\$OMP_NAME" "\$\$" "\$proc_start" >"\$MARKER"
+release_router_lock
 
-ready=0
-for _ in \$(seq 1 300); do
-  body="\$(curl -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null || true)"
-  grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"\$body" && { ready=1; break; }
-  [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break
-  sleep 1
-done
-(( ready )) || { podman logs --tail=120 "\$LLAMA_NAME" >&2 || true; exit 5; }
+# Heartbeat lets the reaper distinguish a live terminal/session from stale state
+# left by SIGKILL, terminal crashes, or abrupt process death.
+parent_pid=\$\$
+(
+  while kill -0 "\$parent_pid" 2>/dev/null; do
+    touch "\$MARKER" 2>/dev/null || exit 0
+    sleep 20
+  done
+) &
+HB_PID=\$!
 
 secret_args=()
 [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
 
-echo "[omp-ai] Router ready. Use /model to switch models."
-podman run --rm -it --name "\$OMP_NAME" --replace \
+echo "[omp-ai] Shared router ready; session \$SESSION_ID"
+echo "[omp-ai] llama parallel slots: \$LLAMA_PARALLEL; model cache limit: \$MODELS_MAX"
+podman run --rm -it --name "\$OMP_NAME" \
   --network omp-web --network omp-llm \
   --memory "\$OMP_MEM" --cpus 8 --pids-limit 1024 \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
@@ -777,9 +927,11 @@ fi
 
 sid="\$(sudo -n "\$SHARE_HELPER" begin)"
 child=""
+share_hb=""
 cleanup(){
   rc=\$?
   trap - EXIT INT TERM HUP
+  [[ -n "\$share_hb" ]] && kill "\$share_hb" >/dev/null 2>&1 || true
   [[ -n "\$child" ]] && kill -0 "\$child" 2>/dev/null && kill -TERM "\$child" 2>/dev/null || true
   [[ -n "\$child" ]] && wait "\$child" 2>/dev/null || true
   sudo -n "\$SHARE_HELPER" cleanup "\$sid" >/dev/null 2>&1 || true
@@ -796,6 +948,15 @@ done
 set +e
 sudo -n -u "\$AI_USER" "\$INNER" --workdir "\$rel" "\${inner_shares[@]}" -- "\${omp_args[@]}" &
 child=\$!
+child_start="\$(awk '{print \$22}' "/proc/\$child/stat" 2>/dev/null || true)"
+sudo -n "\$SHARE_HELPER" attach "\$sid" "\$child" "\$child_start" >/dev/null
+(
+  while kill -0 "\$child" 2>/dev/null; do
+    sudo -n "\$SHARE_HELPER" heartbeat "\$sid" >/dev/null 2>&1 || exit 0
+    sleep 20
+  done
+) &
+share_hb=\$!
 wait "\$child"; rc=\$?; child=""
 set -e
 exit "\$rc"
@@ -815,7 +976,7 @@ cmd="\${1:-help}"; shift || true
 
 idle(){
   runuser -u "\$AI_USER" -- env HOME="$AI_HOME" XDG_RUNTIME_DIR="/run/user/$AI_UID" \
-    podman ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^ompai-(agent|llama)$' &&
+    podman ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^ompai-(agent-|llama$)' &&
     { echo "Stop omp-ai before changing models" >&2; exit 3; } || true
 }
 validate(){
@@ -891,18 +1052,22 @@ REAPER="/usr/local/libexec/omp-ai-reap"
 root tee "$REAPER" >/dev/null <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_USER="$AI_USER"; AI_HOME="$AI_HOME"; AI_UID="$AI_UID"; SHARE_HELPER="$SHARE_HELPER"
-as_ai(){ runuser -u "\$AI_USER" -- env HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin "\$@"; }
-lease="/run/user/\$AI_UID/omp-ai.lease"
-if as_ai podman ps --format '{{.Names}}' 2>/dev/null | grep -qx ompai-agent; then exit 0; fi
-if [[ -e "\$lease" ]]; then
-  now=\$(date +%s); mt=\$(stat -c %Y "\$lease" 2>/dev/null || echo 0)
-  (( now-mt < 600 )) && exit 0
-fi
-as_ai podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
-rm -f "\$lease"
-"\$SHARE_HELPER" cleanup-stale 600 >/dev/null 2>&1 || true
+AI_USER="$AI_USER"
+AI_HOME="$AI_HOME"
+AI_UID="$AI_UID"
+INNER="$INNER"
+SHARE_HELPER="$SHARE_HELPER"
+
+runuser -u "\$AI_USER" -- env \
+  HOME="\$AI_HOME" USER="\$AI_USER" LOGNAME="\$AI_USER" \
+  XDG_RUNTIME_DIR="/run/user/\$AI_UID" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin \
+  "\$INNER" reap 120 >/dev/null 2>&1 || true
+
+# Direct-share wrapper has its own heartbeat. Three minutes without one means
+# the owning terminal/wrapper disappeared; restore its ACLs and unmount staging.
+"\$SHARE_HELPER" cleanup-stale 180 >/dev/null 2>&1 || true
 EOF
 root chmod 0755 "$REAPER"
 root tee /etc/systemd/system/omp-ai-reaper.service >/dev/null <<EOF
@@ -925,13 +1090,18 @@ EOF
 root systemctl daemon-reload
 root systemctl enable --now omp-ai-reaper.timer
 
+mapfile -t _old_agents < <(as_ai podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
+(( ${#_old_agents[@]} )) && as_ai podman rm -f -t 5 "${_old_agents[@]}" >/dev/null 2>&1 || true
 as_ai podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
+as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
 root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 
 echo
 ok "Setup complete"
-echo "Workspace:    $WORKSPACE"
-echo "Model store: $MODEL_STORE"
+echo "Workspace:       $WORKSPACE"
+echo "Model store:    $MODEL_STORE"
+echo "Model instances: $MODELS_MAX"
+echo "Llama slots:     $LLAMA_PARALLEL"
 echo
 echo "Examples:"
 echo "  ai-model add ~/Downloads/model.gguf"

@@ -7,8 +7,8 @@ Rootless Podman sandbox for running **OMP (oh-my-pi)** with local GGUF models th
 - dedicated host user `ompai`;
 - rootless, daemonless Podman;
 - NVIDIA GPU through CDI;
-- `llama.cpp` multi-model router;
-- models load only while `omp-ai` is running;
+- one shared `llama.cpp` multi-model router for all concurrent OMP windows;
+- models stay loaded only while at least one OMP session is active;
 - configurable persistent model store;
 - persistent `~/AI` workspace;
 - temporary direct `--share` and `--share-ro` access to files/projects outside `~/AI`;
@@ -40,7 +40,7 @@ chmod +x setup-omp-ai.sh
 ./setup-omp-ai.sh
 ```
 
-The installer is intended to be re-runnable.
+The installer is intended to be re-runnable. Treat re-running it as a maintenance operation: it force-stops currently active OMP session containers and the shared llama router before finishing the update.
 
 ## Persistent data areas
 
@@ -141,6 +141,16 @@ For the original target machine (32 GiB RAM / 8 GiB VRAM), keep:
 ```ini
 MODELS_MAX=1
 ```
+
+`MODELS_MAX` is the number of different model instances the router may keep resident. It is independent from the number of OMP windows. Ten OMP sessions can all share the same one loaded model.
+
+The number of simultaneous llama inference slots is controlled separately:
+
+```ini
+LLAMA_PARALLEL=1
+```
+
+With `LLAMA_PARALLEL=1`, multiple OMP windows are fully usable at the same time, but overlapping LLM requests are queued/serialized by llama.cpp. This is the conservative default for 32 GiB RAM / 8 GiB VRAM because extra parallel slots consume additional KV-cache memory. If resources permit, try `LLAMA_PARALLEL=2`.
 
 ## Normal workspace
 
@@ -243,6 +253,8 @@ For `--share` (RW), files created by the agent are handed back to the desktop us
 
 A systemd reaper also cleans stale direct-share sessions after crashes/reboots.
 
+Direct shares from different OMP windows may run concurrently as long as their source paths do not overlap. The helper deliberately rejects sharing the exact same path, a parent, or a child of an already-active direct share; otherwise one session could restore temporary ACLs while another session still depends on them. If you need several OMP windows on the same project, place that project in the persistent `~/AI` workspace.
+
 ### Direct-share security contract
 
 Anything passed via:
@@ -285,15 +297,97 @@ omp-ai \
   --share-ro ~/Documents/reference.pdf
 ```
 
+## Multiple OMP windows
+
+Multiple independent OMP processes are supported. Start them from separate terminals, for example:
+
+```bash
+# terminal 1
+cd ~/AI/project-a
+omp-ai
+```
+
+```bash
+# terminal 2
+cd ~/AI/project-b
+omp-ai
+```
+
+```bash
+# terminal 3
+omp-ai --share ~/code/project-c
+```
+
+Each session gets its own Podman container with a unique name such as:
+
+```text
+ompai-agent-<uuid>
+```
+
+but every session connects to the same:
+
+```text
+ompai-llama
+```
+
+router. The lifecycle is reference-counted through per-session heartbeat markers:
+
+```text
+first OMP session starts
+        -> start llama router
+        -> active sessions = 1
+
+second OMP session starts
+        -> reuse existing router
+        -> active sessions = 2
+
+first session exits
+        -> remove only its OMP container
+        -> router remains
+
+last session exits
+        -> remove its OMP container
+        -> stop llama router
+        -> release model RAM/VRAM
+```
+
+If a terminal or launcher dies with `SIGKILL`, the heartbeat stops. The systemd reaper removes stale OMP containers/session markers and shuts down the router once no live sessions remain.
+
+### Concurrent models and inference
+
+With:
+
+```ini
+MODELS_MAX=1
+LLAMA_PARALLEL=1
+```
+
+all windows share one model slot and one inference slot. This gives the lowest memory use. Several windows can be open, use tools and queue model requests, but only one llama inference runs at a time.
+
+If two windows select different models while `MODELS_MAX=1`, the router may need to evict/reload models between requests. For concurrent work, using the same model in all windows is much faster.
+
+If you have enough memory for additional KV cache, increase:
+
+```ini
+LLAMA_PARALLEL=2
+```
+
+to allow two llama inference slots. Re-run `./setup-omp-ai.sh` after changing it.
+
 Useful runtime commands:
 
 ```bash
+# show shared router + every OMP session container
 omp-ai status
+
+# follow the shared llama.cpp router logs
 omp-ai logs
+
+# force-stop ALL OMP sessions, the shared router, and stale direct shares
 omp-ai stop
 ```
 
-When OMP exits, its container and the `llama.cpp` router are removed and model RAM/VRAM is released.
+Closing one OMP window no longer unloads the model if another OMP session is still active. RAM/VRAM is released after the **last** session exits (or after `omp-ai stop`).
 
 ## Web search
 
@@ -379,4 +473,4 @@ omp-ai stop
 
 `omp-ai stop` also immediately asks the privileged share helper to restore any stale direct-share ACL state; normally the session wrapper performs this cleanup automatically.
 
-If a direct-share session was killed abnormally, the installed systemd reaper restores stale share ACLs and removes abandoned containers automatically.
+If an OMP process or direct-share wrapper is killed abnormally, the installed systemd reaper uses session/share heartbeats to remove abandoned containers, restore stale share ACLs, and stop the shared llama router when no live sessions remain.
