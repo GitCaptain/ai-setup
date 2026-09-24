@@ -138,3 +138,20 @@ This is container isolation, not a VM: the host kernel is still shared.
 ## Re-running setup
 
 The installer is idempotent enough for normal maintenance. Re-running it updates helpers/config/builds and force-stops currently active OMP sessions while doing so.
+
+
+## OMP installation
+
+OMP is **not built from source**. The installer creates a small OCI runtime image and installs the official prebuilt OMP binary inside it with:
+
+```bash
+curl -fsSL https://omp.sh/install | sh -s -- --binary
+```
+
+By default the latest stable release is used. You can pin a release tag in `omp-ai.conf`:
+
+```ini
+OMP_VERSION=v18.1.15
+```
+
+Older versions of this setup cloned OMP into `/var/lib/ompai/src/oh-my-pi`; the installer now removes that obsolete checkout on rerun.

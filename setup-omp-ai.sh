@@ -20,8 +20,9 @@ LLAMA_PORT=18080
 VRAM_RESERVE_MIB=2048
 LLAMA_CACHE_RAM_MIB=0
 
-OMP_REPO="https://github.com/can1357/oh-my-pi.git"
-OMP_REF="main"
+# Empty = latest stable release from the official OMP installer.
+# You may pin a release tag, e.g. OMP_VERSION=v18.1.15.
+OMP_VERSION=""
 OMP_MEM="3g"
 
 AI_SLICE_MEM="25G"
@@ -41,6 +42,12 @@ log(){ printf '\033[1;34m[omp-ai]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m[omp-ai]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[omp-ai]\033[0m %s\n' "$*" >&2; }
 die(){ printf '\033[1;31m[omp-ai] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+on_err(){
+  local rc=$? line="${BASH_LINENO[0]:-?}" cmd="${BASH_COMMAND:-?}"
+  printf '\033[1;31m[omp-ai] FAILED:\033[0m line %s: %s (exit %s)\n' "$line" "$cmd" "$rc" >&2
+  exit "$rc"
+}
+trap on_err ERR
 
 usage(){ cat <<'TXT'
 Usage: ./setup-omp-ai.sh [options]
@@ -70,7 +77,7 @@ for a in "$@"; do case "$a" in -h|--help) usage; exit 0;; esac; done
 args=("$@")
 for ((i=0;i<${#args[@]};i++)); do
   case "${args[i]}" in
-    --config) CONFIG_FILE="${args[i+1]:?--config needs PATH}"; ((i++));;
+    --config) CONFIG_FILE="${args[i+1]:?--config needs PATH}"; ((++i));;
     --config=*) CONFIG_FILE="${args[i]#*=}";;
   esac
 done
@@ -103,7 +110,17 @@ set_cfg(){
     LLAMA_CTX) warn "LLAMA_CTX is deprecated; treating it as LLAMA_CTX_PER_SLOT"; LLAMA_CTX_PER_SLOT="$v";;
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
-    OMP_REPO) OMP_REPO="$v";; OMP_REF) OMP_REF="$v";; OMP_MEM) OMP_MEM="$v";;
+    OMP_VERSION) OMP_VERSION="$v";;
+    OMP_REPO) warn "OMP_REPO is deprecated and ignored; OMP is installed from the official binary installer";;
+    OMP_REF)
+      if [[ -n "$v" && "$v" != main ]]; then
+        warn "OMP_REF is deprecated; treating '$v' as OMP_VERSION release tag"
+        OMP_VERSION="$v"
+      else
+        warn "OMP_REF=main is deprecated and ignored; using the latest stable binary release"
+      fi
+      ;;
+    OMP_MEM) OMP_MEM="$v";;
     AI_SLICE_MEM) AI_SLICE_MEM="$v";; AI_SLICE_CPU) AI_SLICE_CPU="$v";;
     EXA_API_KEY) EXA_API_KEY="$v";; WEB_SEARCH_PRIMARY) WEB_SEARCH_PRIMARY="$v";; WEB_SEARCH_FALLBACK) WEB_SEARCH_FALLBACK="$v";;
     HARDEN_HOME) HARDEN_HOME="$v";; ASSUME_YES) ASSUME_YES="$v";; "") ;;
@@ -115,7 +132,7 @@ load_config(){
   local line k v n=0
   [[ -f "$1" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
-    ((n++)); line="${line%$'\r'}"; line="$(trim "$line")"
+    ((++n)); line="${line%$'\r'}"; line="$(trim "$line")"
     [[ -z "$line" || "$line" == \#* || "$line" == \;* || "$line" == \[*\] ]] && continue
     [[ "$line" == *=* ]] || die "$1:$n: expected KEY=VALUE"
     k="$(trim "${line%%=*}")"; v="$(unquote "$(trim "${line#*=}")")"
@@ -164,7 +181,7 @@ case "${WEB_SEARCH_FALLBACK,,}" in ""|none|off) WEB_SEARCH_FALLBACK="";; exa|duc
 if [[ -n "$EXA_API_KEY" && -f "$CONFIG_FILE" ]]; then as_main chmod 0600 "$CONFIG_FILE"; fi
 
 log "Installing packages..."
-root pacman -S --needed --noconfirm podman crun passt netavark aardvark-dns fuse-overlayfs nvidia-container-toolkit git curl rsync acl sudo shadow
+root pacman -S --needed --noconfirm podman crun passt netavark aardvark-dns fuse-overlayfs nvidia-container-toolkit git curl rsync acl sudo shadow python
 
 log "Creating isolated host account and workspace..."
 getent group "$SHARE_GROUP" >/dev/null || root groupadd "$SHARE_GROUP"
@@ -174,6 +191,7 @@ root passwd -l "$AI_USER" >/dev/null 2>&1 || true
 root usermod -s /usr/bin/nologin "$AI_USER"
 root usermod -aG "$SHARE_GROUP" "$AI_USER"; root usermod -aG "$SHARE_GROUP" "$MAIN_USER"
 AI_UID="$(id -u "$AI_USER")"; AI_GID="$(id -g "$AI_USER")"; MAIN_UID="$(id -u "$MAIN_USER")"; MAIN_GID="$(id -g "$MAIN_USER")"
+root chown "$AI_USER:$AI_GID" "$AI_HOME"
 root chmod 0700 "$AI_HOME"
 
 if (( HARDEN_HOME )); then
@@ -202,16 +220,86 @@ MemorySwapMax=0
 CPUQuota=$AI_SLICE_CPU
 TasksMax=4096
 EOT
+
+log "Reloading systemd and enabling linger for $AI_USER..."
 root systemctl daemon-reload
 root loginctl enable-linger "$AI_USER"
-root systemctl start "user@${AI_UID}.service"
-AI_RUNTIME="/run/user/$AI_UID"
-for _ in $(seq 1 30); do [[ -d "$AI_RUNTIME" ]] && break; sleep 1; done
-[[ -d "$AI_RUNTIME" ]] || die "No runtime dir for $AI_USER"
 
-as_ai(){ root runuser -u "$AI_USER" -- env HOME="$AI_HOME" USER="$AI_USER" LOGNAME="$AI_USER" XDG_RUNTIME_DIR="$AI_RUNTIME" DBUS_SESSION_BUS_ADDRESS="unix:path=$AI_RUNTIME/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" "$@"; }
-info="$(as_ai podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupVersion}} {{.Host.CgroupManager}}' 2>/dev/null || true)"
-[[ "$info" == true* && "$info" == *systemd* ]] || die "Rootless Podman/systemd cgroups unavailable: $info"
+# Do not block forever in `systemctl start`. user@UID.service may wait on a
+# broken user-manager dependency/config; start asynchronously and diagnose it
+# explicitly below.
+log "Starting systemd user manager for $AI_USER (UID $AI_UID)..."
+root systemctl start --no-block "user@${AI_UID}.service"
+AI_RUNTIME="/run/user/$AI_UID"
+user_manager_ok=0
+for _ in $(seq 1 60); do
+  state="$(root systemctl is-active "user@${AI_UID}.service" 2>/dev/null || true)"
+  if [[ "$state" == active && -d "$AI_RUNTIME" ]]; then
+    user_manager_ok=1
+    break
+  fi
+  if [[ "$state" == failed ]]; then
+    break
+  fi
+  sleep 0.5
+done
+
+if (( ! user_manager_ok )); then
+  warn "systemd user manager did not become ready for $AI_USER."
+  root systemctl status "user@${AI_UID}.service" --no-pager -l >&2 || true
+  root journalctl -b -u "user@${AI_UID}.service" --no-pager -n 80 >&2 || true
+  die "Cannot start user@${AI_UID}.service / create $AI_RUNTIME"
+fi
+
+# The drop-in is persistent; set-property also makes reruns apply the limits to
+# an already-existing slice immediately.
+root systemctl set-property --runtime "user-${AI_UID}.slice"   "MemoryMax=$AI_SLICE_MEM" "MemorySwapMax=0"   "CPUQuota=$AI_SLICE_CPU" "TasksMax=4096" >/dev/null
+ok "systemd user manager is ready: $AI_RUNTIME"
+
+as_ai(){
+  # The installer itself normally runs from somewhere below $MAIN_HOME, which
+  # is intentionally chmod 0700.  After switching to ompai, inheriting that
+  # cwd makes getcwd()/Podman fail even though HOME/XDG_RUNTIME_DIR are valid.
+  # Enter AI_HOME *as ompai* before executing every rootless command.
+  root runuser -u "$AI_USER" -- env \
+    HOME="$AI_HOME" USER="$AI_USER" LOGNAME="$AI_USER" \
+    XDG_RUNTIME_DIR="$AI_RUNTIME" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$AI_RUNTIME/bus" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" \
+    /bin/bash -c 'cd "$HOME" && exec "$@"' bash "$@"
+}
+
+log "Checking rootless Podman for $AI_USER..."
+podman_err="$(mktemp)"
+if ! info_json="$(as_ai podman info --format json 2>"$podman_err")"; then
+  warn "Rootless Podman failed to initialize for $AI_USER. Actual Podman error:"
+  sed 's/^/  /' "$podman_err" >&2 || true
+  rm -f "$podman_err"
+  die "Rootless Podman initialization failed"
+fi
+rm -f "$podman_err"
+
+# Do not rely on Podman's Go-template struct field names here. They have
+# changed across releases even when the stable JSON keys stayed the same.
+# Arch currently ships Podman 6.x, so parse the documented JSON interface.
+if ! info="$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+h = d.get("host") or d.get("Host") or {}
+sec = h.get("security") or h.get("Security") or {}
+rootless = sec.get("rootless", h.get("rootless", h.get("Rootless", False)))
+cgv = h.get("cgroupVersion", h.get("CgroupVersion", ""))
+cgm = h.get("cgroupManager", h.get("CgroupManager", ""))
+print(str(bool(rootless)).lower(), cgv, cgm)
+' <<<"$info_json")"; then
+  die "Could not parse 'podman info --format json'"
+fi
+
+read -r podman_rootless podman_cgroup_version podman_cgroup_manager <<<"$info"
+log "Podman: rootless=$podman_rootless cgroups=$podman_cgroup_version manager=$podman_cgroup_manager"
+[[ "$podman_rootless" == true ]] || die "Podman is not running rootless for $AI_USER"
+[[ "$podman_cgroup_version" == v2 ]] || die "Podman requires cgroup v2 here; got: ${podman_cgroup_version:-<missing>}"
+[[ "$podman_cgroup_manager" == systemd ]] || die "Podman cgroup manager is '${podman_cgroup_manager:-<missing>}', expected 'systemd'"
 
 root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/state" "$AI_HOME/state/.omp" "$AI_HOME/state/.omp/agent" "$AI_HOME/src" "$AI_HOME/build"
 root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE"
@@ -272,12 +360,46 @@ root nvidia-ctk cdi list | grep -q '^nvidia.com/gpu=all$' || die "NVIDIA CDI una
 as_ai podman network exists omp-llm 2>/dev/null || as_ai podman network create --internal omp-llm >/dev/null
 as_ai podman network exists omp-web 2>/dev/null || as_ai podman network create omp-web >/dev/null
 
-log "Building OMP and pulling llama.cpp..."
-OMP_SRC="$AI_HOME/src/oh-my-pi"
-[[ -d "$OMP_SRC/.git" ]] || as_ai git clone "$OMP_REPO" "$OMP_SRC"
-as_ai git -C "$OMP_SRC" fetch --prune origin
-if as_ai git -C "$OMP_SRC" rev-parse --verify --quiet "origin/$OMP_REF" >/dev/null; then as_ai git -C "$OMP_SRC" checkout --detach "origin/$OMP_REF"; else as_ai git -C "$OMP_SRC" fetch origin "$OMP_REF"; as_ai git -C "$OMP_SRC" checkout --detach FETCH_HEAD; fi
-as_ai podman build --pull=newer -t localhost/omp:latest "$OMP_SRC"
+log "Building lightweight OMP runtime from the official prebuilt binary..."
+OMP_BUILD_DIR="$AI_HOME/build/omp-runtime"
+root rm -rf "$OMP_BUILD_DIR"
+root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$OMP_BUILD_DIR"
+
+# Remove the checkout created by older versions of this installer. OMP is no
+# longer built from source; the official installer downloads a release binary.
+root rm -rf "$AI_HOME/src/oh-my-pi" 2>/dev/null || true
+root rmdir "$AI_HOME/src" 2>/dev/null || true
+
+as_ai tee "$OMP_BUILD_DIR/Containerfile" >/dev/null <<'EOT'
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl git openssh-client tini sqlite3 unzip \
+      build-essential pkg-config libssl-dev jq ripgrep fd-find \
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG OMP_VERSION=""
+ENV PI_INSTALL_DIR=/usr/local/bin
+RUN curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh \
+ && if [ -n "$OMP_VERSION" ]; then \
+      sh /tmp/install-omp.sh --binary --ref "$OMP_VERSION"; \
+    else \
+      sh /tmp/install-omp.sh --binary; \
+    fi \
+ && rm -f /tmp/install-omp.sh \
+ && /usr/local/bin/omp --version
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/omp"]
+CMD []
+EOT
+
+as_ai podman build --pull=newer \
+  --build-arg "OMP_VERSION=$OMP_VERSION" \
+  -f "$OMP_BUILD_DIR/Containerfile" \
+  -t localhost/omp:latest "$OMP_BUILD_DIR"
+
 as_ai podman pull "$LLAMA_IMAGE"
 as_ai podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
 
@@ -355,6 +477,7 @@ root tee "$INNER" >/dev/null <<EOT
 set -Eeuo pipefail
 AI_HOME="$AI_HOME"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_PER_SLOT="$LLAMA_CTX_PER_SLOT"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
+cd "\$AI_HOME"
 LLAMA_NAME=ompai-llama; SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"; ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"; mkdir -p "\$SESS_DIR"; chmod 0700 "\$SESS_DIR"
 with_lock(){ exec 8>"\$ROUTER_LOCK"; flock 8; }; unlock(){ flock -u 8 || true; exec 8>&-; }
 has_sessions(){ local m=(); shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; (( \${#m[@]} > 0 )); }
@@ -403,7 +526,7 @@ with_lock; start_router || { unlock; exit 5; }; proc_start="\$(awk '{print \$22}
 parent=\$\$; ( while kill -0 "\$parent" 2>/dev/null; do touch "\$MARKER" 2>/dev/null || exit 0; sleep 20; done ) & HB_PID=\$!
 secret_args=(); [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
 echo "[omp-ai] Shared router ready; session \$SESSION_ID"
-podman run --rm -it --name "\$OMP_NAME" --network omp-web --network omp-llm --memory "\$OMP_MEM" --cpus 8 --pids-limit 1024 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=1g --tmpfs /data:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$WORKSPACE,dst=/workspace,rw=true,bind-nonrecursive" --mount "type=bind,src=\$AI_HOME/state,dst=/state,rw=true,bind-nonrecursive" "\${share_mounts[@]}" "\${secret_args[@]}" -e HOME=/state -e "TERM=\$TERM" -e LLAMA_CPP_BASE_URL=http://llama:8080 -w "\$container_workdir" localhost/omp:latest cli "\${omp_args[@]}"
+podman run --rm -it --name "\$OMP_NAME" --network omp-web --network omp-llm --memory "\$OMP_MEM" --cpus 8 --pids-limit 1024 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=1g --tmpfs /data:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$WORKSPACE,dst=/workspace,rw=true,bind-nonrecursive" --mount "type=bind,src=\$AI_HOME/state,dst=/state,rw=true,bind-nonrecursive" "\${share_mounts[@]}" "\${secret_args[@]}" -e HOME=/state -e "TERM=\$TERM" -e LLAMA_CPP_BASE_URL=http://llama:8080 -w "\$container_workdir" localhost/omp:latest "\${omp_args[@]}"
 EOT
 root chmod 0755 "$INNER"
 
@@ -432,6 +555,7 @@ root tee "$MODEL_HELPER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
 STORE="$MODEL_STORE"; AI_USER="$AI_USER"; AI_GID="$AI_GID"; MAIN_USER="$MAIN_USER"; AI_HOME="$AI_HOME"; AI_UID="$AI_UID"
+cd "\$AI_HOME"
 cmd="\${1:-help}"; shift || true
 idle(){ runuser -u "\$AI_USER" -- env HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" podman ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^ompai-(agent-|llama$)' && { echo "Stop omp-ai before changing models" >&2; exit 3; } || true; }
 validate(){ local src="\$1" f found=0; runuser -u "\$MAIN_USER" -- test -r "\$src" || return 1; if [[ -f "\$src" ]]; then [[ "\${src,,}" == *.gguf && "\$(runuser -u "\$MAIN_USER" -- head -c4 "\$src")" == GGUF ]]; return; fi; [[ -d "\$src" ]] || return 1; find "\$src" -type l -print -quit | grep -q . && return 1; while IFS= read -r -d '' f; do found=1; [[ "\$(runuser -u "\$MAIN_USER" -- head -c4 "\$f")" == GGUF ]] || return 1; done < <(find "\$src" -type f -iname '*.gguf' -print0); (( found )); }
