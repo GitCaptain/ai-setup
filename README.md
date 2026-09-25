@@ -121,6 +121,41 @@ ai-model path
 
 `MODEL_STORE` is persistent and mounted read-only into llama.cpp as `/models`.
 
+## Updating OMP
+
+The OMP agent container is read-only, so `omp update` inside OMP cannot replace `/usr/local/bin/omp`. Update the image from the host instead:
+
+```bash
+omp-ai update
+```
+
+The command rebuilds only `localhost/omp:latest` from the official prebuilt OMP binary. It does **not** rerun pacman, NVIDIA setup, model imports, or the full installer. Close active OMP windows first; the updater refuses to run while agent sessions are active.
+
+If `OMP_VERSION` is empty in the installed configuration, `omp-ai update` fetches the latest stable release. If it is pinned, the command rebuilds that pinned version; change `OMP_VERSION` and rerun `setup-omp-ai.sh` to change the pin.
+
+## Container persistence
+
+Each OMP window is an **ephemeral** Podman container created with `--rm` and a read-only root filesystem. Closing the window removes that container. Therefore system-level changes inside the container are not a persistence mechanism (and writes such as replacing `/usr/local/bin/omp` fail outright).
+
+What persists:
+
+```text
+/workspace  -> host WORKSPACE (/srv/ompai/workspace by default)   persistent RW
+/state      -> AI_HOME/state                                     persistent RW
+/shares/... -> explicitly shared host paths                       persistent on host
+/models     -> model store, used by llama.cpp                     persistent, read-only to llama
+```
+
+What does not persist:
+
+```text
+container root filesystem  read-only + container removed on exit
+/tmp                       tmpfs, disappears on exit
+/data                      tmpfs, disappears on exit
+```
+
+So if OMP writes config/session/plugin data under its HOME (`/state`) or files under `/workspace`, those changes survive. Installing an OS package or binary into the container root does not.
+
 ## Security summary
 
 - dedicated locked host user `ompai`;

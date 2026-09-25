@@ -360,17 +360,37 @@ root nvidia-ctk cdi list | grep -q '^nvidia.com/gpu=all$' || die "NVIDIA CDI una
 as_ai podman network exists omp-llm 2>/dev/null || as_ai podman network create --internal omp-llm >/dev/null
 as_ai podman network exists omp-web 2>/dev/null || as_ai podman network create omp-web >/dev/null
 
-log "Building lightweight OMP runtime from the official prebuilt binary..."
-OMP_BUILD_DIR="$AI_HOME/build/omp-runtime"
-root rm -rf "$OMP_BUILD_DIR"
-root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$OMP_BUILD_DIR"
+# ----- lightweight OMP image updater -----
+# OMP runs from a read-only ephemeral container, so `omp update` inside the
+# container cannot replace /usr/local/bin/omp.  This helper updates only the
+# rootless Podman image and is exposed as `omp-ai update`.
+root install -d -m 0755 /usr/local/libexec
+OMP_UPDATE_HELPER="/usr/local/libexec/omp-ai-update"
+root tee "$OMP_UPDATE_HELPER" >/dev/null <<EOT
+#!/usr/bin/env bash
+set -Eeuo pipefail
+AI_HOME="$AI_HOME"
+AI_USER="$AI_USER"
+AI_UID="$AI_UID"
+OMP_VERSION="$OMP_VERSION"
+BUILD_DIR="$AI_HOME/build/omp-runtime"
 
-# Remove the checkout created by older versions of this installer. OMP is no
-# longer built from source; the official installer downloads a release binary.
-root rm -rf "$AI_HOME/src/oh-my-pi" 2>/dev/null || true
-root rmdir "$AI_HOME/src" 2>/dev/null || true
+[[ "\$(id -un)" == "\$AI_USER" ]] || { echo "omp-ai-update must run as \$AI_USER" >&2; exit 1; }
+export HOME="\$AI_HOME"
+export XDG_RUNTIME_DIR="/run/user/\$AI_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
+cd "\$AI_HOME"
 
-as_ai tee "$OMP_BUILD_DIR/Containerfile" >/dev/null <<'EOT'
+if podman ps --format '{{.Names}}' | grep -q '^ompai-agent-'; then
+  echo "Active OMP sessions exist. Close them (or run: omp-ai stop) before updating." >&2
+  exit 3
+fi
+
+old_version="\$(podman run --rm localhost/omp:latest --version 2>/dev/null || true)"
+rm -rf -- "\$BUILD_DIR"
+install -d -m 0700 "\$BUILD_DIR"
+cat >"\$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
@@ -381,10 +401,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 ARG OMP_VERSION=""
+ARG OMP_UPDATE_EPOCH=""
 ENV PI_INSTALL_DIR=/usr/local/bin
-RUN curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh \
- && if [ -n "$OMP_VERSION" ]; then \
-      sh /tmp/install-omp.sh --binary --ref "$OMP_VERSION"; \
+RUN echo "\$OMP_UPDATE_EPOCH" >/dev/null \
+ && curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh \
+ && if [ -n "\$OMP_VERSION" ]; then \
+      sh /tmp/install-omp.sh --binary --ref "\$OMP_VERSION"; \
     else \
       sh /tmp/install-omp.sh --binary; \
     fi \
@@ -393,12 +415,31 @@ RUN curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh \
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/omp"]
 CMD []
-EOT
+CONTAINERFILE
 
-as_ai podman build --pull=newer \
-  --build-arg "OMP_VERSION=$OMP_VERSION" \
-  -f "$OMP_BUILD_DIR/Containerfile" \
-  -t localhost/omp:latest "$OMP_BUILD_DIR"
+echo "[omp-ai] Updating OMP runtime image..."
+podman build --pull=newer \
+  --build-arg "OMP_VERSION=\$OMP_VERSION" \
+  --build-arg "OMP_UPDATE_EPOCH=\$(date +%s)" \
+  -f "\$BUILD_DIR/Containerfile" \
+  -t localhost/omp:latest "\$BUILD_DIR"
+new_version="\$(podman run --rm localhost/omp:latest --version)"
+if [[ -n "\$old_version" ]]; then
+  echo "[omp-ai] OMP: \$old_version -> \$new_version"
+else
+  echo "[omp-ai] OMP installed: \$new_version"
+fi
+EOT
+root chmod 0755 "$OMP_UPDATE_HELPER"
+root chown root:root "$OMP_UPDATE_HELPER"
+
+# Remove the checkout created by older versions of this installer. OMP is no
+# longer built from source; the official installer downloads a release binary.
+root rm -rf "$AI_HOME/src/oh-my-pi" 2>/dev/null || true
+root rmdir "$AI_HOME/src" 2>/dev/null || true
+
+log "Building/updating lightweight OMP runtime from the official prebuilt binary..."
+as_ai "$OMP_UPDATE_HELPER"
 
 as_ai podman pull "$LLAMA_IMAGE"
 as_ai podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
@@ -535,8 +576,12 @@ PUBLIC="/usr/local/bin/omp-ai"
 root tee "$PUBLIC" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"
-case "\${1:-}" in stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;; status|logs) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";; esac
+INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"
+case "\${1:-}" in
+  stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
+  status|logs) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
+  update) shift; (( \$# == 0 )) || { echo "Usage: omp-ai update" >&2; exit 2; }; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
+esac
 pwd_real="\$(realpath -m "\$PWD")"; rel=""; case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
 modes=(); paths=(); omp_args=(); while (( \$# )); do case "\$1" in --share) modes+=(rw); paths+=("\${2:?}"); shift 2;; --share-ro) modes+=(ro); paths+=("\${2:?}"); shift 2;; --) shift; omp_args+=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
 if (( \${#paths[@]} == 0 )); then exec sudo -n -u "\$AI_USER" "\$INNER" --workdir "\$rel" -- "\${omp_args[@]}"; fi
@@ -579,6 +624,7 @@ root chmod 0755 /usr/local/bin/ai-give
 
 root tee /etc/sudoers.d/omp-ai >/dev/null <<EOT
 $MAIN_USER ALL=($AI_USER) NOPASSWD: $INNER *
+$MAIN_USER ALL=($AI_USER) NOPASSWD: $OMP_UPDATE_HELPER
 $MAIN_USER ALL=(root) NOPASSWD: $MODEL_HELPER *
 $MAIN_USER ALL=(root) NOPASSWD: $SHARE_HELPER *
 EOT
