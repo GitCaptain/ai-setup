@@ -139,14 +139,20 @@ If `OMP_VERSION` is pinned in the installed configuration, `omp-ai update` insta
 
 ## Persistent workbench and package installation
 
-The OMP environment is currently based on:
+The persistent workbench defaults to:
 
 ```text
-python:3.12-slim-bookworm
-        -> Debian 12 (Bookworm)
+debian:13-slim
+    -> Debian 13 (Trixie)
 ```
 
-So the system package manager is **APT**, not pacman. For example, the agent can run:
+The base is configurable in `omp-ai.conf`:
+
+```ini
+WORKBENCH_BASE_IMAGE=debian:13-slim
+```
+
+The generated workbench image installs Python 3, pip/venv, the C/C++ build toolchain, git, curl, SSH client, SQLite, jq, ripgrep and a few basic utilities. The system package manager is **APT**, not pacman. For example, the agent can run:
 
 ```bash
 apt-get update
@@ -162,6 +168,27 @@ cargo install ...
 ```
 
 Those changes are written to the `ompai-workbench` container's writable layer and remain there when the container is stopped and started again.
+
+### Why Debian 13? Other bases
+
+Debian is not required. The workbench wants a conventional glibc Linux with broad developer-package availability and predictable upgrades. Debian 13 is the default because it is small, current stable, and has a large APT ecosystem.
+
+`ubuntu:26.04` is also a reasonable choice if you prefer Ubuntu/LTS vendor documentation and somewhat newer distro packages:
+
+```ini
+WORKBENCH_BASE_IMAGE=ubuntu:26.04
+```
+
+The current generated Containerfile assumes an **APT + glibc** base, so Debian and Ubuntu are supported directly. Alpine is deliberately not the default because its musl libc can make third-party/prebuilt developer binaries more troublesome. Arch would give very fresh packages but is rolling-release, which makes a long-lived autonomous workbench less reproducible. Fedora could work, but would require a separate `dnf` build path and brings little benefit for this setup.
+
+Changing `WORKBENCH_BASE_IMAGE` rebuilds `localhost/omp:latest`, but an existing persistent `ompai-workbench` is **not silently destroyed**. To move an existing workbench to the new OS, first close sessions and then run:
+
+```bash
+omp-ai stop
+omp-ai reset-env
+```
+
+This intentionally removes packages/files installed only into the old workbench rootfs; `/workspace`, `/state`, models and direct-share source data are not removed. The next `omp-ai` creates a clean persistent workbench from the newly built base image.
 
 Persistent areas now look like:
 

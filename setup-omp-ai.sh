@@ -23,6 +23,8 @@ LLAMA_CACHE_RAM_MIB=0
 # Empty = latest stable release from the official OMP installer.
 # You may pin a release tag, e.g. OMP_VERSION=v18.1.15.
 OMP_VERSION=""
+# Apt/glibc-based persistent workbench. Debian 13 is the current stable default.
+WORKBENCH_BASE_IMAGE="debian:13-slim"
 OMP_MEM="3g"
 
 AI_SLICE_MEM="25G"
@@ -65,6 +67,7 @@ Overrides:
   --vram-reserve MIB
   --llama-memory SIZE
   --omp-memory SIZE
+  --workbench-base-image IMAGE
   --exa-api-key KEY
   --web-search auto|exa|duckduckgo
   -y, --yes
@@ -111,6 +114,7 @@ set_cfg(){
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
     OMP_VERSION) OMP_VERSION="$v";;
+    WORKBENCH_BASE_IMAGE) WORKBENCH_BASE_IMAGE="$v";;
     OMP_REPO) warn "OMP_REPO is deprecated and ignored; OMP is installed from the official binary installer";;
     OMP_REF)
       if [[ -n "$v" && "$v" != main ]]; then
@@ -154,6 +158,7 @@ while (($#)); do
     --vram-reserve) VRAM_RESERVE_MIB="${2:?}"; shift 2;;
     --llama-memory) LLAMA_MEM="${2:?}"; shift 2;;
     --omp-memory) OMP_MEM="${2:?}"; shift 2;;
+    --workbench-base-image) WORKBENCH_BASE_IMAGE="${2:?}"; shift 2;;
     --exa-api-key) EXA_API_KEY="${2:?}"; shift 2;;
     --web-search) WEB_SEARCH_PRIMARY="${2:?}"; shift 2;;
     -y|--yes) ASSUME_YES=true; shift;;
@@ -174,6 +179,7 @@ case "$MODEL_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "MODEL_STORE must be out
 [[ "$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || die "LLAMA_CACHE_RAM_MIB must be >= 0"
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
 [[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] || die "LLAMA_PORT must be an integer"
+[[ -n "$WORKBENCH_BASE_IMAGE" && "$WORKBENCH_BASE_IMAGE" != *[[:space:]]* ]] || die "WORKBENCH_BASE_IMAGE must be a non-empty image reference without whitespace"
 
 case "${WEB_SEARCH_PRIMARY,,}" in auto) [[ -n "$EXA_API_KEY" ]] && WEB_SEARCH_PRIMARY=exa || WEB_SEARCH_PRIMARY=duckduckgo;; exa|duckduckgo) WEB_SEARCH_PRIMARY="${WEB_SEARCH_PRIMARY,,}";; *) die "WEB_SEARCH_PRIMARY must be auto/exa/duckduckgo";; esac
 case "${WEB_SEARCH_FALLBACK,,}" in ""|none|off) WEB_SEARCH_FALLBACK="";; exa|duckduckgo) WEB_SEARCH_FALLBACK="${WEB_SEARCH_FALLBACK,,}";; *) die "WEB_SEARCH_FALLBACK must be exa/duckduckgo/none";; esac
@@ -381,8 +387,10 @@ AI_HOME="$AI_HOME"
 AI_USER="$AI_USER"
 AI_UID="$AI_UID"
 OMP_VERSION="$OMP_VERSION"
+WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"
 BUILD_DIR="$AI_HOME/build/omp-runtime"
 WORKBENCH=ompai-workbench
+MODE="\${1:-update}"
 SESS_DIR="/run/user/$AI_UID/omp-ai-sessions"
 
 [[ "\$(id -un)" == "\$AI_USER" ]] || { echo "omp-ai-update must run as \$AI_USER" >&2; exit 1; }
@@ -400,7 +408,7 @@ shopt -u nullglob
   exit 3
 }
 
-if podman container exists "\$WORKBENCH"; then
+if [[ "\$MODE" != rebuild-base ]] && podman container exists "\$WORKBENCH"; then
   was_running="\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)"
   [[ "\$was_running" == true ]] || podman start "\$WORKBENCH" >/dev/null
   old_version="\$(podman exec "\$WORKBENCH" /usr/local/bin/omp --version 2>/dev/null || true)"
@@ -432,12 +440,14 @@ old_version="\$(podman run --rm --entrypoint /usr/local/bin/omp localhost/omp:la
 rm -rf -- "\$BUILD_DIR"
 install -d -m 0700 "\$BUILD_DIR"
 cat >"\$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
-FROM python:3.12-slim-bookworm
+ARG BASE_IMAGE=debian:13-slim
+FROM ${BASE_IMAGE}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash ca-certificates curl git openssh-client tini sqlite3 unzip \
       build-essential pkg-config libssl-dev jq ripgrep fd-find \
+      python3 python3-pip python3-venv python-is-python3 \
  && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
  && rm -rf /var/lib/apt/lists/*
 
@@ -458,8 +468,9 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/bin/sleep", "infinity"]
 CONTAINERFILE
 
-echo "[omp-ai] Building/updating OMP workbench base image..."
+echo "[omp-ai] Building/updating OMP workbench base image: \$WORKBENCH_BASE_IMAGE"
 podman build --pull=newer \
+  --build-arg "BASE_IMAGE=\$WORKBENCH_BASE_IMAGE" \
   --build-arg "OMP_VERSION=\$OMP_VERSION" \
   --build-arg "OMP_UPDATE_EPOCH=\$(date +%s)" \
   -f "\$BUILD_DIR/Containerfile" \
@@ -480,9 +491,20 @@ root rm -rf "$AI_HOME/src/oh-my-pi" 2>/dev/null || true
 root rmdir "$AI_HOME/src" 2>/dev/null || true
 
 log "Building/updating lightweight OMP runtime from the official prebuilt binary..."
-as_ai "$OMP_UPDATE_HELPER"
+as_ai "$OMP_UPDATE_HELPER" rebuild-base
 
 as_ai podman pull "$LLAMA_IMAGE"
+
+# Rebuilding localhost/omp:latest does not mutate an already-created writable
+# workbench rootfs. Preserve it rather than silently deleting user-installed
+# packages; tell the user how to migrate explicitly.
+if as_ai podman container exists ompai-workbench 2>/dev/null; then
+  current_base="$(as_ai podman inspect -f '{{ index .Config.Labels "io.ompai.workbench-base" }}' ompai-workbench 2>/dev/null || true)"
+  if [[ "$current_base" != "$WORKBENCH_BASE_IMAGE" ]]; then
+    warn "Existing ompai-workbench was created from '${current_base:-legacy/unknown}'. New base image is '$WORKBENCH_BASE_IMAGE'."
+    warn "To migrate the workbench OS, run: omp-ai stop && omp-ai reset-env  (this removes packages installed inside the old workbench rootfs)."
+  fi
+fi
 as_ai podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
 
 root install -d -m 0755 /usr/local/libexec
@@ -571,7 +593,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_PER_SLOT="$LLAMA_CTX_PER_SLOT"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_PER_SLOT="$LLAMA_CTX_PER_SLOT"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 LLAMA_NAME=ompai-llama
@@ -587,8 +609,9 @@ healthy(){ curl -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null | grep -
 workbench_running(){ [[ "\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)" == true ]]; }
 ensure_workbench(){
   if ! podman container exists "\$WORKBENCH"; then
-    echo "[omp-ai] Creating persistent Debian workbench..."
+    echo "[omp-ai] Creating persistent workbench from localhost/omp:latest (base: \$WORKBENCH_BASE_IMAGE)..."
     podman create --name "\$WORKBENCH" \
+      --label "io.ompai.workbench-base=\$WORKBENCH_BASE_IMAGE" \
       --network omp-web --network omp-llm \
       --memory "\$OMP_MEM" --cpus 8 --pids-limit 4096 \
       --security-opt no-new-privileges \
@@ -827,6 +850,7 @@ echo "Model store:      $MODEL_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
 echo "Context per slot: $LLAMA_CTX_PER_SLOT"
+echo "Workbench base:   $WORKBENCH_BASE_IMAGE"
 echo
 echo "Next: ai-model add /path/model.gguf && omp-ai"
-echo "Persistent env: omp-ai shell  # Debian 12; apt installs survive restarts"
+echo "Persistent env: omp-ai shell  # apt installs survive restarts"
