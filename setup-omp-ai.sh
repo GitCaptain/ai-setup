@@ -259,7 +259,7 @@ fi
 
 # The drop-in is persistent; set-property also makes reruns apply the limits to
 # an already-existing slice immediately.
-root systemctl set-property --runtime "user-${AI_UID}.slice"   "MemoryMax=$AI_SLICE_MEM" "MemorySwapMax=0"   "CPUQuota=$AI_SLICE_CPU" "TasksMax=4096" >/dev/null
+root timeout 15s systemctl set-property --runtime "user-${AI_UID}.slice"   "MemoryMax=$AI_SLICE_MEM" "MemorySwapMax=0"   "CPUQuota=$AI_SLICE_CPU" "TasksMax=4096" >/dev/null
 ok "systemd user manager is ready: $AI_RUNTIME"
 
 as_ai(){
@@ -277,7 +277,17 @@ as_ai(){
 
 log "Checking rootless Podman for $AI_USER..."
 podman_err="$(mktemp)"
-if ! info_json="$(as_ai podman info --format json 2>"$podman_err")"; then
+set +e
+info_json="$(as_ai timeout --kill-after=5s 15s podman info --format json 2>"$podman_err")"
+podman_rc=$?
+set -e
+if (( podman_rc != 0 )); then
+  if (( podman_rc == 124 || podman_rc == 137 )); then
+    warn "Rootless Podman did not answer within 15s. A stale Podman/conmon process may be holding libpod/storage state."
+    root ps -u "$AI_USER" -o pid,ppid,stat,etime,pcpu,cmd --sort=-pcpu >&2 || true
+    rm -f "$podman_err"
+    die "Podman is wedged. Recover with: sudo loginctl terminate-user $AI_USER ; sudo systemctl start user-runtime-dir@${AI_UID}.service ; sudo systemctl start --no-block user@${AI_UID}.service ; then rerun setup."
+  fi
   warn "Rootless Podman failed to initialize for $AI_USER. Actual Podman error:"
   sed 's/^/  /' "$podman_err" >&2 || true
   rm -f "$podman_err"
@@ -400,6 +410,15 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
 cd "\$AI_HOME"
 
+pctl(){ timeout --kill-after=3s 20s podman "\$@"; }
+pupdate(){ timeout --kill-after=10s 600s podman "\$@"; }
+pbuild(){ timeout --kill-after=20s 1800s podman "\$@"; }
+container_exists(){
+  local rc=0
+  pctl container exists "\$1" || rc=\$?
+  case \$rc in 0) return 0;; 1) return 1;; *) echo "[omp-ai] ERROR: Podman control operation failed (rc=\$rc)." >&2; exit "\$rc";; esac
+}
+
 shopt -s nullglob
 markers=("\$SESS_DIR"/*.session)
 shopt -u nullglob
@@ -408,26 +427,26 @@ shopt -u nullglob
   exit 3
 }
 
-if [[ "\$MODE" != rebuild-base ]] && podman container exists "\$WORKBENCH"; then
-  was_running="\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)"
-  [[ "\$was_running" == true ]] || podman start "\$WORKBENCH" >/dev/null
-  old_version="\$(podman exec "\$WORKBENCH" /usr/local/bin/omp --version 2>/dev/null || true)"
+if [[ "\$MODE" != rebuild-base ]] && container_exists "\$WORKBENCH"; then
+  was_running="\$(pctl inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)"
+  [[ "\$was_running" == true ]] || pctl start "\$WORKBENCH" >/dev/null
+  old_version="\$(pctl exec "\$WORKBENCH" /usr/local/bin/omp --version 2>/dev/null || true)"
 
   if [[ -n "\$OMP_VERSION" ]]; then
     echo "[omp-ai] Updating persistent workbench OMP to pinned version: \$OMP_VERSION"
-    podman exec -e "OMP_VERSION=\$OMP_VERSION" -e PI_INSTALL_DIR=/usr/local/bin "\$WORKBENCH" /bin/bash -lc '
+    pupdate exec -e "OMP_VERSION=\$OMP_VERSION" -e PI_INSTALL_DIR=/usr/local/bin "\$WORKBENCH" /bin/bash -lc '
       set -e
-      curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh
+      curl --connect-timeout 10 --max-time 300 -fsSL https://omp.sh/install -o /tmp/install-omp.sh
       sh /tmp/install-omp.sh --binary --ref "\$OMP_VERSION"
       rm -f /tmp/install-omp.sh
     '
   else
     echo "[omp-ai] Updating OMP inside persistent workbench..."
-    podman exec "\$WORKBENCH" /usr/local/bin/omp update
+    pupdate exec "\$WORKBENCH" /usr/local/bin/omp update
   fi
 
-  new_version="\$(podman exec "\$WORKBENCH" /usr/local/bin/omp --version)"
-  [[ "\$was_running" == true ]] || podman stop -t 10 "\$WORKBENCH" >/dev/null
+  new_version="\$(pctl exec "\$WORKBENCH" /usr/local/bin/omp --version)"
+  [[ "\$was_running" == true ]] || pctl stop -t 10 "\$WORKBENCH" >/dev/null
   if [[ -n "\$old_version" ]]; then
     echo "[omp-ai] OMP: \$old_version -> \$new_version"
   else
@@ -436,12 +455,12 @@ if [[ "\$MODE" != rebuild-base ]] && podman container exists "\$WORKBENCH"; then
   exit 0
 fi
 
-old_version="\$(podman run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version 2>/dev/null || true)"
+old_version="\$(pctl run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version 2>/dev/null || true)"
 rm -rf -- "\$BUILD_DIR"
 install -d -m 0700 "\$BUILD_DIR"
 cat >"\$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
 ARG BASE_IMAGE=debian:13-slim
-FROM ${BASE_IMAGE}
+FROM \${BASE_IMAGE}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -469,13 +488,13 @@ CMD ["/bin/sleep", "infinity"]
 CONTAINERFILE
 
 echo "[omp-ai] Building/updating OMP workbench base image: \$WORKBENCH_BASE_IMAGE"
-podman build --pull=newer \
+pbuild build --pull=newer \
   --build-arg "BASE_IMAGE=\$WORKBENCH_BASE_IMAGE" \
   --build-arg "OMP_VERSION=\$OMP_VERSION" \
   --build-arg "OMP_UPDATE_EPOCH=\$(date +%s)" \
   -f "\$BUILD_DIR/Containerfile" \
   -t localhost/omp:latest "\$BUILD_DIR"
-new_version="\$(podman run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version)"
+new_version="\$(pctl run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version)"
 if [[ -n "\$old_version" ]]; then
   echo "[omp-ai] OMP base image: \$old_version -> \$new_version"
 else
@@ -498,14 +517,14 @@ as_ai podman pull "$LLAMA_IMAGE"
 # Rebuilding localhost/omp:latest does not mutate an already-created writable
 # workbench rootfs. Preserve it rather than silently deleting user-installed
 # packages; tell the user how to migrate explicitly.
-if as_ai podman container exists ompai-workbench 2>/dev/null; then
-  current_base="$(as_ai podman inspect -f '{{ index .Config.Labels "io.ompai.workbench-base" }}' ompai-workbench 2>/dev/null || true)"
+if as_ai timeout --kill-after=3s 20s podman container exists ompai-workbench 2>/dev/null; then
+  current_base="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{ index .Config.Labels "io.ompai.workbench-base" }}' ompai-workbench 2>/dev/null || true)"
   if [[ "$current_base" != "$WORKBENCH_BASE_IMAGE" ]]; then
     warn "Existing ompai-workbench was created from '${current_base:-legacy/unknown}'. New base image is '$WORKBENCH_BASE_IMAGE'."
     warn "To migrate the workbench OS, run: omp-ai stop && omp-ai reset-env  (this removes packages installed inside the old workbench rootfs)."
   fi
 fi
-as_ai podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
+as_ai timeout --kill-after=5s 180s podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
 
 root install -d -m 0755 /usr/local/libexec
 
@@ -522,7 +541,11 @@ AI_USER="$AI_USER"; MAIN_USER="$MAIN_USER"; MAIN_UID="$MAIN_UID"; MAIN_GID="$MAI
 [[ \$EUID -eq 0 ]] || exit 1
 valid_sid(){ [[ "\$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 sdir(){ valid_sid "\$1" || exit 2; printf '%s/%s' "\$STATE" "\$1"; }
-exec 9>"\$STATE/.lock"; flock 9
+exec 9>"\$STATE/.lock"
+if ! flock -w 10 9; then
+  echo "[omp-ai] ERROR: share-state lock is busy for >10s; refusing to hang." >&2
+  exit 6
+fi
 prepare_stage(){
   # Direct shares are bind-mounted below STAGE after the persistent workbench
   # may already be running.  Make STAGE a shared mount point so rslave
@@ -602,15 +625,32 @@ SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"
 EXEC_DIR="\$AI_HOME/state/runtime/omp-exec"
 ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"
 mkdir -p "\$SESS_DIR" "\$EXEC_DIR"; chmod 0700 "\$SESS_DIR" "\$EXEC_DIR"
-with_lock(){ exec 8>"\$ROUTER_LOCK"; flock 8; }
+pctl(){ timeout --kill-after=3s 20s podman "\$@"; }
+container_exists(){
+  local rc=0
+  pctl container exists "\$1" || rc=\$?
+  case \$rc in 0) return 0;; 1) return 1;; *) echo "[omp-ai] ERROR: Podman control operation failed (rc=\$rc)." >&2; return "\$rc";; esac
+}
+with_lock(){
+  exec 8>"\$ROUTER_LOCK"
+  if ! flock -w 10 8; then
+    echo "[omp-ai] ERROR: lifecycle lock is busy for >10s; refusing to hang." >&2
+    echo "[omp-ai] Check: ps -fu \$USER | grep '[o]mp-ai'" >&2
+    exec 8>&-
+    return 1
+  fi
+}
 unlock(){ flock -u 8 || true; exec 8>&-; }
 has_sessions(){ local m=(); shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; (( \${#m[@]} > 0 )); }
-healthy(){ curl -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; }
-workbench_running(){ [[ "\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)" == true ]]; }
+healthy(){ curl --connect-timeout 2 --max-time 4 -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; }
+workbench_running(){ [[ "\$(pctl inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)" == true ]]; }
 ensure_workbench(){
-  if ! podman container exists "\$WORKBENCH"; then
+  local exists_rc=0
+  container_exists "\$WORKBENCH" || exists_rc=\$?
+  if (( exists_rc > 1 )); then return "\$exists_rc"; fi
+  if (( exists_rc == 1 )); then
     echo "[omp-ai] Creating persistent workbench from localhost/omp:latest (base: \$WORKBENCH_BASE_IMAGE)..."
-    podman create --name "\$WORKBENCH" \
+    pctl create --name "\$WORKBENCH" \
       --label "io.ompai.workbench-base=\$WORKBENCH_BASE_IMAGE" \
       --network omp-web --network omp-llm \
       --memory "\$OMP_MEM" --cpus 8 --pids-limit 4096 \
@@ -622,22 +662,22 @@ ensure_workbench(){
       localhost/omp:latest >/dev/null
   fi
   if ! workbench_running; then
-    podman start "\$WORKBENCH" >/dev/null
+    pctl start "\$WORKBENCH" >/dev/null
     # A stopped workbench may contain aliases/meta from a previous crashed boot.
     podman exec "\$WORKBENCH" /bin/bash -lc 'mkdir -p /shares /state/runtime/omp-exec; rm -rf /shares/* /state/runtime/omp-exec/*' >/dev/null 2>&1 || true
   fi
 }
 stop_if_unused(){
   if ! has_sessions; then
-    workbench_running && podman stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
-    podman rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+    workbench_running && pctl stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
+    pctl rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   fi
 }
 start_router(){
-  if [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
-  podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+  if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
+  pctl rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx/slot=\$LLAMA_CTX_PER_SLOT"
-  podman run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
+  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
     --models-dir /models --models-max "\$MODELS_MAX" --models-autoload \
     --host 0.0.0.0 --port 8080 \
     --parallel "\$LLAMA_PARALLEL" \
@@ -648,45 +688,62 @@ start_router(){
     --cache-type-k q8_0 --cache-type-v q8_0 \
     --flash-attn auto --fit on --fit-target "\$VRAM_RESERVE_MIB" \
     --offline >/dev/null
-  for _ in \$(seq 1 300); do healthy && return 0; [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break; sleep 1; done
-  podman logs --tail=120 "\$LLAMA_NAME" >&2 || true; return 1
+  for _ in \$(seq 1 300); do healthy && return 0; [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break; sleep 1; done
+  pctl logs --tail=120 "\$LLAMA_NAME" >&2 || true; return 1
 }
 kill_exec_session(){
   local sid="\$1" meta="\$EXEC_DIR/\$1.pid" pid exe
   [[ -f "\$meta" && workbench_running ]] || { rm -f "\$meta"; return 0; }
   read -r pid <"\$meta" || true
   [[ "\${pid:-}" =~ ^[0-9]+$ ]] || { rm -f "\$meta"; return 0; }
-  exe="\$(podman exec "\$WORKBENCH" readlink -f "/proc/\$pid/exe" 2>/dev/null || true)"
+  exe="\$(pctl exec "\$WORKBENCH" readlink -f "/proc/\$pid/exe" 2>/dev/null || true)"
   if [[ "\$exe" == /usr/local/bin/omp ]]; then
-    podman exec "\$WORKBENCH" kill -TERM "\$pid" >/dev/null 2>&1 || true
+    pctl exec "\$WORKBENCH" kill -TERM "\$pid" >/dev/null 2>&1 || true
   fi
-  podman exec "\$WORKBENCH" rm -rf -- "/shares/\$sid" >/dev/null 2>&1 || true
+  pctl exec "\$WORKBENCH" rm -rf -- "/shares/\$sid" >/dev/null 2>&1 || true
   rm -f "\$meta"
 }
 case "\${1:-}" in
   stop)
-    with_lock
-    workbench_running && podman stop -t 5 "\$WORKBENCH" >/dev/null 2>&1 || true
+    # stop is an operator command and must never hang forever behind a stale
+    # lifecycle lock or a wedged container runtime operation.
+    exec 8>"\$ROUTER_LOCK"
+    if ! flock -w 8 8; then
+      echo "[omp-ai] ERROR: lifecycle lock is still busy after 8s; refusing to hang." >&2
+      echo "[omp-ai] Check for a stuck launcher: ps -fu \$USER | grep '[o]mp-ai'" >&2
+      exit 6
+    fi
+    if workbench_running; then
+      timeout 15s podman stop -t 5 "\$WORKBENCH" >/dev/null 2>&1 || {
+        echo "[omp-ai] Workbench did not stop cleanly; forcing kill..." >&2
+        timeout 10s podman kill "\$WORKBENCH" >/dev/null 2>&1 || true
+      }
+    fi
     rm -f "\$SESS_DIR"/*.session "\$EXEC_DIR"/*.pid 2>/dev/null || true
-    podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
-    unlock; exit 0;;
+    timeout 15s podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+    unlock
+    echo "[omp-ai] All OMP sessions/router stopped; persistent workbench preserved."
+    exit 0;;
   status)
-    podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|workbench)' || true; }
+    pctl ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|workbench)' || true; }
     shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; echo "Active OMP sessions: \${#m[@]}"; exit 0;;
   logs) shift; exec podman logs -f "\$LLAMA_NAME";;
   shell)
     ensure_workbench
     set +e; podman exec -it "\$WORKBENCH" /bin/bash; rc=\$?; set -e
-    has_sessions || podman stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
+    has_sessions || pctl stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
     exit "\$rc";;
   reset-env)
     has_sessions && { echo "Active OMP sessions exist; close them first." >&2; exit 3; }
-    podman rm -f -t 5 "\$WORKBENCH" >/dev/null 2>&1 || true
+    timeout 20s podman rm -f -t 5 "\$WORKBENCH" >/dev/null 2>&1 || {
+      echo "[omp-ai] ERROR: failed to remove persistent workbench." >&2
+      exit 7
+    }
     rm -f "\$EXEC_DIR"/*.pid 2>/dev/null || true
     echo "[omp-ai] Persistent workbench removed. Next omp-ai launch creates a clean one from localhost/omp:latest."
     exit 0;;
   reap)
-    age="\${2:-120}"; now="\$(date +%s)"; with_lock; shopt -s nullglob
+    age="\${2:-120}"; now="\$(date +%s)"; with_lock || exit 6; shopt -s nullglob
     for m in "\$SESS_DIR"/*.session; do
       mt="\$(stat -c %Y "\$m" 2>/dev/null || echo 0)"; sid="\$(basename "\$m" .session)"; pid="\$(sed -n '2p' "\$m" || echo 0)"; start="\$(sed -n '3p' "\$m" || echo 0)"; cur="\$(awk '{print \$22}' "/proc/\$pid/stat" 2>/dev/null || true)"; live=0; [[ "\$pid" != 0 && -n "\$cur" && "\$cur" == "\$start" ]] && live=1
       if (( !live && now-mt >= age )); then kill_exec_session "\$sid"; rm -f "\$m"; fi
@@ -701,19 +758,19 @@ container_workdir=/workspace; [[ "\$candidate" != "\$WORKSPACE" ]] && container_
 find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q . || { echo "No models. Use ai-model add ..." >&2; exit 3; }
 SESSION_ID="\$(cat /proc/sys/kernel/random/uuid)"; MARKER="\$SESS_DIR/\$SESSION_ID.session"; HB_PID=""
 
-with_lock; start_router || { unlock; exit 5; }; ensure_workbench; proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"; printf '%s\n%s\n%s\n' "\$SESSION_ID" "\$\$" "\$proc_start" >"\$MARKER"; unlock
+with_lock || exit 6; start_router || { unlock; exit 5; }; ensure_workbench; proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"; printf '%s\n%s\n%s\n' "\$SESSION_ID" "\$\$" "\$proc_start" >"\$MARKER"; unlock
 
 # Create convenient per-session aliases for direct shares.  The real mounts
 # live below SHARE_STAGE and arrive through rslave propagation.
 first_share_dir=""
 if (( \${#share_sources[@]} )); then
-  podman exec "\$WORKBENCH" mkdir -p "/shares/\$SESSION_ID"
+  pctl exec "\$WORKBENCH" mkdir -p "/shares/\$SESSION_ID"
   declare -A used=()
   for i in "\${!share_sources[@]}"; do
     src="\$(realpath -e -- "\${share_sources[\$i]}")"; case "\$src" in "\$SHARE_STAGE"/*) ;; *) exit 2;; esac
     base="\$(basename -- "\$src" | sed 's/^[0-9][0-9][0-9][0-9]-//')"; name="\$base"; n=2; while [[ -n "\${used[\$name]:-}" ]]; do name="\${base}-\$n"; ((++n)); done; used["\$name"]=1
     dst="/shares/\$SESSION_ID/\$name"
-    podman exec "\$WORKBENCH" ln -s -- "\$src" "\$dst"
+    pctl exec "\$WORKBENCH" ln -s -- "\$src" "\$dst"
     [[ -z "\$first_share_dir" && -d "\$src" ]] && first_share_dir="\$dst"
   done
 fi
@@ -722,9 +779,16 @@ fi
 cleanup(){
   rc=\$?; trap - EXIT INT TERM HUP
   [[ -n "\$HB_PID" ]] && kill "\$HB_PID" >/dev/null 2>&1 || true
-  workbench_running && podman exec "\$WORKBENCH" rm -rf -- "/shares/\$SESSION_ID" >/dev/null 2>&1 || true
+  workbench_running && pctl exec "\$WORKBENCH" rm -rf -- "/shares/\$SESSION_ID" >/dev/null 2>&1 || true
   rm -f "\$EXEC_DIR/\$SESSION_ID.pid"
-  with_lock; rm -f "\$MARKER"; stop_if_unused; unlock
+  if with_lock; then
+    rm -f "\$MARKER"
+    stop_if_unused
+    unlock
+  else
+    rm -f "\$MARKER"
+    echo "[omp-ai] WARN: cleanup could not acquire lifecycle lock; reaper will finish cleanup." >&2
+  fi
   exit "\$rc"
 }
 trap cleanup EXIT INT TERM HUP
@@ -837,10 +901,10 @@ EOT
 root systemctl daemon-reload; root systemctl enable --now omp-ai-reaper.timer
 
 # Maintenance cleanup after rewriting helpers.
-mapfile -t old_agents < <(as_ai podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
-(( ${#old_agents[@]} )) && as_ai podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
-as_ai podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
-as_ai podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+mapfile -t old_agents < <(as_ai timeout --kill-after=3s 20s podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
+(( ${#old_agents[@]} )) && as_ai timeout --kill-after=3s 20s podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
+as_ai timeout --kill-after=3s 20s podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
+as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
 as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
 root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 
