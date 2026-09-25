@@ -360,10 +360,18 @@ root nvidia-ctk cdi list | grep -q '^nvidia.com/gpu=all$' || die "NVIDIA CDI una
 as_ai podman network exists omp-llm 2>/dev/null || as_ai podman network create --internal omp-llm >/dev/null
 as_ai podman network exists omp-web 2>/dev/null || as_ai podman network create omp-web >/dev/null
 
-# ----- lightweight OMP image updater -----
-# OMP runs from a read-only ephemeral container, so `omp update` inside the
-# container cannot replace /usr/local/bin/omp.  This helper updates only the
-# rootless Podman image and is exposed as `omp-ai update`.
+# The persistent workbench mounts this parent with rslave propagation so
+# direct-share bind mounts created later become visible without recreating it.
+SHARE_STAGE="/run/omp-ai-shares"
+root install -d -o root -g root -m 0711 "$SHARE_STAGE"
+if ! root mountpoint -q "$SHARE_STAGE"; then root mount --bind "$SHARE_STAGE" "$SHARE_STAGE"; fi
+root mount --make-rshared "$SHARE_STAGE"
+
+# ----- OMP updater -----
+# The runtime uses a persistent writable workbench container.  If the
+# workbench already exists, update OMP in-place so all user-installed apt/pip/
+# npm/cargo tooling survives.  Before the first workbench exists, build the
+# base image from the official prebuilt OMP binary.
 root install -d -m 0755 /usr/local/libexec
 OMP_UPDATE_HELPER="/usr/local/libexec/omp-ai-update"
 root tee "$OMP_UPDATE_HELPER" >/dev/null <<EOT
@@ -374,6 +382,8 @@ AI_USER="$AI_USER"
 AI_UID="$AI_UID"
 OMP_VERSION="$OMP_VERSION"
 BUILD_DIR="$AI_HOME/build/omp-runtime"
+WORKBENCH=ompai-workbench
+SESS_DIR="/run/user/$AI_UID/omp-ai-sessions"
 
 [[ "\$(id -un)" == "\$AI_USER" ]] || { echo "omp-ai-update must run as \$AI_USER" >&2; exit 1; }
 export HOME="\$AI_HOME"
@@ -382,12 +392,43 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
 cd "\$AI_HOME"
 
-if podman ps --format '{{.Names}}' | grep -q '^ompai-agent-'; then
+shopt -s nullglob
+markers=("\$SESS_DIR"/*.session)
+shopt -u nullglob
+(( \${#markers[@]} == 0 )) || {
   echo "Active OMP sessions exist. Close them (or run: omp-ai stop) before updating." >&2
   exit 3
+}
+
+if podman container exists "\$WORKBENCH"; then
+  was_running="\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)"
+  [[ "\$was_running" == true ]] || podman start "\$WORKBENCH" >/dev/null
+  old_version="\$(podman exec "\$WORKBENCH" /usr/local/bin/omp --version 2>/dev/null || true)"
+
+  if [[ -n "\$OMP_VERSION" ]]; then
+    echo "[omp-ai] Updating persistent workbench OMP to pinned version: \$OMP_VERSION"
+    podman exec -e "OMP_VERSION=\$OMP_VERSION" -e PI_INSTALL_DIR=/usr/local/bin "\$WORKBENCH" /bin/bash -lc '
+      set -e
+      curl -fsSL https://omp.sh/install -o /tmp/install-omp.sh
+      sh /tmp/install-omp.sh --binary --ref "\$OMP_VERSION"
+      rm -f /tmp/install-omp.sh
+    '
+  else
+    echo "[omp-ai] Updating OMP inside persistent workbench..."
+    podman exec "\$WORKBENCH" /usr/local/bin/omp update
+  fi
+
+  new_version="\$(podman exec "\$WORKBENCH" /usr/local/bin/omp --version)"
+  [[ "\$was_running" == true ]] || podman stop -t 10 "\$WORKBENCH" >/dev/null
+  if [[ -n "\$old_version" ]]; then
+    echo "[omp-ai] OMP: \$old_version -> \$new_version"
+  else
+    echo "[omp-ai] OMP installed: \$new_version"
+  fi
+  exit 0
 fi
 
-old_version="\$(podman run --rm localhost/omp:latest --version 2>/dev/null || true)"
+old_version="\$(podman run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version 2>/dev/null || true)"
 rm -rf -- "\$BUILD_DIR"
 install -d -m 0700 "\$BUILD_DIR"
 cat >"\$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
@@ -413,21 +454,21 @@ RUN echo "\$OMP_UPDATE_EPOCH" >/dev/null \
  && rm -f /tmp/install-omp.sh \
  && /usr/local/bin/omp --version
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/omp"]
-CMD []
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/bin/sleep", "infinity"]
 CONTAINERFILE
 
-echo "[omp-ai] Updating OMP runtime image..."
+echo "[omp-ai] Building/updating OMP workbench base image..."
 podman build --pull=newer \
   --build-arg "OMP_VERSION=\$OMP_VERSION" \
   --build-arg "OMP_UPDATE_EPOCH=\$(date +%s)" \
   -f "\$BUILD_DIR/Containerfile" \
   -t localhost/omp:latest "\$BUILD_DIR"
-new_version="\$(podman run --rm localhost/omp:latest --version)"
+new_version="\$(podman run --rm --entrypoint /usr/local/bin/omp localhost/omp:latest --version)"
 if [[ -n "\$old_version" ]]; then
-  echo "[omp-ai] OMP: \$old_version -> \$new_version"
+  echo "[omp-ai] OMP base image: \$old_version -> \$new_version"
 else
-  echo "[omp-ai] OMP installed: \$new_version"
+  echo "[omp-ai] OMP base image installed: \$new_version"
 fi
 EOT
 root chmod 0755 "$OMP_UPDATE_HELPER"
@@ -460,6 +501,15 @@ AI_USER="$AI_USER"; MAIN_USER="$MAIN_USER"; MAIN_UID="$MAIN_UID"; MAIN_GID="$MAI
 valid_sid(){ [[ "\$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 sdir(){ valid_sid "\$1" || exit 2; printf '%s/%s' "\$STATE" "\$1"; }
 exec 9>"\$STATE/.lock"; flock 9
+prepare_stage(){
+  # Direct shares are bind-mounted below STAGE after the persistent workbench
+  # may already be running.  Make STAGE a shared mount point so rslave
+  # propagation carries new host submounts into the workbench namespace.
+  if ! mountpoint -q "\$STAGE"; then
+    mount --bind "\$STAGE" "\$STAGE"
+  fi
+  mount --make-rshared "\$STAGE"
+}
 cleanup_one(){
   local sid="\$1" d item src mnt before after
   d="\$(sdir "\$sid")"; [[ -d "\$d" ]] || return 0
@@ -477,7 +527,11 @@ cleanup_one(){
   rm -rf -- "\$STAGE/\$sid" "\$d"
 }
 case "\${1:-}" in
+  prepare)
+    prepare_stage
+    ;;
   begin)
+    prepare_stage
     sid="\$(cat /proc/sys/kernel/random/uuid)"; install -d -m 0700 "\$STATE/\$sid"; install -d -m 0711 "\$STAGE/\$sid"
     date +%s >"\$STATE/\$sid/heartbeat"; echo 0 >"\$STATE/\$sid/owner_pid"; echo 0 >"\$STATE/\$sid/owner_start"; cat /proc/sys/kernel/random/boot_id >"\$STATE/\$sid/boot_id"; echo 0 >"\$STATE/\$sid/count"; : >"\$STATE/\$sid/mounts"; echo "\$sid";;
   grant)
@@ -510,8 +564,9 @@ case "\${1:-}" in
 esac
 EOT
 root chmod 0755 "$SHARE_HELPER"; root chown root:root "$SHARE_HELPER"
+root "$SHARE_HELPER" prepare
 
-# ----- shared llama router + per-window OMP helper -----
+# ----- shared llama router + persistent OMP workbench helper -----
 INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
@@ -519,11 +574,42 @@ set -Eeuo pipefail
 AI_HOME="$AI_HOME"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_PER_SLOT="$LLAMA_CTX_PER_SLOT"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
-LLAMA_NAME=ompai-llama; SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"; ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"; mkdir -p "\$SESS_DIR"; chmod 0700 "\$SESS_DIR"
-with_lock(){ exec 8>"\$ROUTER_LOCK"; flock 8; }; unlock(){ flock -u 8 || true; exec 8>&-; }
+LLAMA_NAME=ompai-llama
+WORKBENCH=ompai-workbench
+SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"
+EXEC_DIR="\$AI_HOME/state/runtime/omp-exec"
+ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"
+mkdir -p "\$SESS_DIR" "\$EXEC_DIR"; chmod 0700 "\$SESS_DIR" "\$EXEC_DIR"
+with_lock(){ exec 8>"\$ROUTER_LOCK"; flock 8; }
+unlock(){ flock -u 8 || true; exec 8>&-; }
 has_sessions(){ local m=(); shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; (( \${#m[@]} > 0 )); }
 healthy(){ curl -fsS "http://127.0.0.1:\$LLAMA_PORT/health" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; }
-stop_if_unused(){ has_sessions || podman rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true; }
+workbench_running(){ [[ "\$(podman inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)" == true ]]; }
+ensure_workbench(){
+  if ! podman container exists "\$WORKBENCH"; then
+    echo "[omp-ai] Creating persistent Debian workbench..."
+    podman create --name "\$WORKBENCH" \
+      --network omp-web --network omp-llm \
+      --memory "\$OMP_MEM" --cpus 8 --pids-limit 4096 \
+      --security-opt no-new-privileges \
+      --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+      --mount "type=bind,src=\$WORKSPACE,dst=/workspace,rw=true,bind-nonrecursive" \
+      --mount "type=bind,src=\$AI_HOME/state,dst=/state,rw=true,bind-nonrecursive" \
+      --mount "type=bind,src=\$SHARE_STAGE,dst=\$SHARE_STAGE,rw=true,bind-propagation=rslave" \
+      localhost/omp:latest >/dev/null
+  fi
+  if ! workbench_running; then
+    podman start "\$WORKBENCH" >/dev/null
+    # A stopped workbench may contain aliases/meta from a previous crashed boot.
+    podman exec "\$WORKBENCH" /bin/bash -lc 'mkdir -p /shares /state/runtime/omp-exec; rm -rf /shares/* /state/runtime/omp-exec/*' >/dev/null 2>&1 || true
+  fi
+}
+stop_if_unused(){
+  if ! has_sessions; then
+    workbench_running && podman stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
+    podman rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+  fi
+}
 start_router(){
   if [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
   podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
@@ -542,14 +628,46 @@ start_router(){
   for _ in \$(seq 1 300); do healthy && return 0; [[ "\$(podman inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break; sleep 1; done
   podman logs --tail=120 "\$LLAMA_NAME" >&2 || true; return 1
 }
+kill_exec_session(){
+  local sid="\$1" meta="\$EXEC_DIR/\$1.pid" pid exe
+  [[ -f "\$meta" && workbench_running ]] || { rm -f "\$meta"; return 0; }
+  read -r pid <"\$meta" || true
+  [[ "\${pid:-}" =~ ^[0-9]+$ ]] || { rm -f "\$meta"; return 0; }
+  exe="\$(podman exec "\$WORKBENCH" readlink -f "/proc/\$pid/exe" 2>/dev/null || true)"
+  if [[ "\$exe" == /usr/local/bin/omp ]]; then
+    podman exec "\$WORKBENCH" kill -TERM "\$pid" >/dev/null 2>&1 || true
+  fi
+  podman exec "\$WORKBENCH" rm -rf -- "/shares/\$sid" >/dev/null 2>&1 || true
+  rm -f "\$meta"
+}
 case "\${1:-}" in
   stop)
-    with_lock; mapfile -t a < <(podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true); (( \${#a[@]} )) && podman rm -f -t 5 "\${a[@]}" >/dev/null 2>&1 || true; rm -f "\$SESS_DIR"/*.session 2>/dev/null || true; podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true; unlock; exit 0;;
-  status) podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|agent-)' || true; }; exit 0;;
+    with_lock
+    workbench_running && podman stop -t 5 "\$WORKBENCH" >/dev/null 2>&1 || true
+    rm -f "\$SESS_DIR"/*.session "\$EXEC_DIR"/*.pid 2>/dev/null || true
+    podman rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
+    unlock; exit 0;;
+  status)
+    podman ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|workbench)' || true; }
+    shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; echo "Active OMP sessions: \${#m[@]}"; exit 0;;
   logs) shift; exec podman logs -f "\$LLAMA_NAME";;
+  shell)
+    ensure_workbench
+    set +e; podman exec -it "\$WORKBENCH" /bin/bash; rc=\$?; set -e
+    has_sessions || podman stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
+    exit "\$rc";;
+  reset-env)
+    has_sessions && { echo "Active OMP sessions exist; close them first." >&2; exit 3; }
+    podman rm -f -t 5 "\$WORKBENCH" >/dev/null 2>&1 || true
+    rm -f "\$EXEC_DIR"/*.pid 2>/dev/null || true
+    echo "[omp-ai] Persistent workbench removed. Next omp-ai launch creates a clean one from localhost/omp:latest."
+    exit 0;;
   reap)
     age="\${2:-120}"; now="\$(date +%s)"; with_lock; shopt -s nullglob
-    for m in "\$SESS_DIR"/*.session; do mt="\$(stat -c %Y "\$m" 2>/dev/null || echo 0)"; agent="\$(sed -n '1p' "\$m" || true)"; pid="\$(sed -n '2p' "\$m" || echo 0)"; start="\$(sed -n '3p' "\$m" || echo 0)"; cur="\$(awk '{print \$22}' "/proc/\$pid/stat" 2>/dev/null || true)"; live=0; [[ "\$pid" != 0 && -n "\$cur" && "\$cur" == "\$start" ]] && live=1; if (( !live && now-mt >= age )); then [[ -n "\$agent" ]] && podman rm -f -t 5 "\$agent" >/dev/null 2>&1 || true; rm -f "\$m"; fi; done
+    for m in "\$SESS_DIR"/*.session; do
+      mt="\$(stat -c %Y "\$m" 2>/dev/null || echo 0)"; sid="\$(basename "\$m" .session)"; pid="\$(sed -n '2p' "\$m" || echo 0)"; start="\$(sed -n '3p' "\$m" || echo 0)"; cur="\$(awk '{print \$22}' "/proc/\$pid/stat" 2>/dev/null || true)"; live=0; [[ "\$pid" != 0 && -n "\$cur" && "\$cur" == "\$start" ]] && live=1
+      if (( !live && now-mt >= age )); then kill_exec_session "\$sid"; rm -f "\$m"; fi
+    done
     shopt -u nullglob; stop_if_unused; unlock; exit 0;;
 esac
 
@@ -557,17 +675,51 @@ workdir_rel=""; share_modes=(); share_sources=(); omp_args=()
 while (( \$# )); do case "\$1" in --workdir) workdir_rel="\${2:-}"; shift 2;; --share) share_modes+=(rw); share_sources+=("\${2:?}"); shift 2;; --share-ro) share_modes+=(ro); share_sources+=("\${2:?}"); shift 2;; --) shift; omp_args=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
 candidate="\$(realpath -m "\$WORKSPACE/\$workdir_rel")"; case "\$candidate" in "\$WORKSPACE"|"\$WORKSPACE"/*) ;; *) exit 2;; esac; [[ -d "\$candidate" ]] || exit 2
 container_workdir=/workspace; [[ "\$candidate" != "\$WORKSPACE" ]] && container_workdir="/workspace/\${candidate#"\$WORKSPACE/"}"
-share_mounts=(); declare -A used=(); first_share_dir=""
-for i in "\${!share_sources[@]}"; do src="\$(realpath -e -- "\${share_sources[\$i]}")"; case "\$src" in "\$SHARE_STAGE"/*) ;; *) exit 2;; esac; base="\$(basename -- "\$src" | sed 's/^[0-9][0-9][0-9][0-9]-//')"; name="\$base"; n=2; while [[ -n "\${used[\$name]:-}" ]]; do name="\${base}-\$n"; ((n++)); done; used["\$name"]=1; dst="/shares/\$name"; [[ "\${share_modes[\$i]}" == ro ]] && share_mounts+=(--mount "type=bind,src=\$src,dst=\$dst,ro=true,bind-nonrecursive") || share_mounts+=(--mount "type=bind,src=\$src,dst=\$dst,rw=true,bind-nonrecursive"); [[ -z "\$first_share_dir" && -d "\$src" ]] && first_share_dir="\$dst"; done
-[[ -n "\$first_share_dir" && -z "\$workdir_rel" ]] && container_workdir="\$first_share_dir"
 find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q . || { echo "No models. Use ai-model add ..." >&2; exit 3; }
-SESSION_ID="\$(cat /proc/sys/kernel/random/uuid)"; OMP_NAME="ompai-agent-\$SESSION_ID"; MARKER="\$SESS_DIR/\$SESSION_ID.session"; HB_PID=""
-cleanup(){ rc=\$?; trap - EXIT INT TERM HUP; [[ -n "\$HB_PID" ]] && kill "\$HB_PID" >/dev/null 2>&1 || true; podman rm -f -t 10 "\$OMP_NAME" >/dev/null 2>&1 || true; with_lock; rm -f "\$MARKER"; stop_if_unused; unlock; exit "\$rc"; }; trap cleanup EXIT INT TERM HUP
-with_lock; start_router || { unlock; exit 5; }; proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"; printf '%s\n%s\n%s\n' "\$OMP_NAME" "\$\$" "\$proc_start" >"\$MARKER"; unlock
+SESSION_ID="\$(cat /proc/sys/kernel/random/uuid)"; MARKER="\$SESS_DIR/\$SESSION_ID.session"; HB_PID=""
+
+with_lock; start_router || { unlock; exit 5; }; ensure_workbench; proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"; printf '%s\n%s\n%s\n' "\$SESSION_ID" "\$\$" "\$proc_start" >"\$MARKER"; unlock
+
+# Create convenient per-session aliases for direct shares.  The real mounts
+# live below SHARE_STAGE and arrive through rslave propagation.
+first_share_dir=""
+if (( \${#share_sources[@]} )); then
+  podman exec "\$WORKBENCH" mkdir -p "/shares/\$SESSION_ID"
+  declare -A used=()
+  for i in "\${!share_sources[@]}"; do
+    src="\$(realpath -e -- "\${share_sources[\$i]}")"; case "\$src" in "\$SHARE_STAGE"/*) ;; *) exit 2;; esac
+    base="\$(basename -- "\$src" | sed 's/^[0-9][0-9][0-9][0-9]-//')"; name="\$base"; n=2; while [[ -n "\${used[\$name]:-}" ]]; do name="\${base}-\$n"; ((++n)); done; used["\$name"]=1
+    dst="/shares/\$SESSION_ID/\$name"
+    podman exec "\$WORKBENCH" ln -s -- "\$src" "\$dst"
+    [[ -z "\$first_share_dir" && -d "\$src" ]] && first_share_dir="\$dst"
+  done
+fi
+[[ -n "\$first_share_dir" && -z "\$workdir_rel" ]] && container_workdir="\$first_share_dir"
+
+cleanup(){
+  rc=\$?; trap - EXIT INT TERM HUP
+  [[ -n "\$HB_PID" ]] && kill "\$HB_PID" >/dev/null 2>&1 || true
+  workbench_running && podman exec "\$WORKBENCH" rm -rf -- "/shares/\$SESSION_ID" >/dev/null 2>&1 || true
+  rm -f "\$EXEC_DIR/\$SESSION_ID.pid"
+  with_lock; rm -f "\$MARKER"; stop_if_unused; unlock
+  exit "\$rc"
+}
+trap cleanup EXIT INT TERM HUP
 parent=\$\$; ( while kill -0 "\$parent" 2>/dev/null; do touch "\$MARKER" 2>/dev/null || exit 0; sleep 20; done ) & HB_PID=\$!
 secret_args=(); [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
-echo "[omp-ai] Shared router ready; session \$SESSION_ID"
-podman run --rm -it --name "\$OMP_NAME" --network omp-web --network omp-llm --memory "\$OMP_MEM" --cpus 8 --pids-limit 1024 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=1g --tmpfs /data:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$WORKSPACE,dst=/workspace,rw=true,bind-nonrecursive" --mount "type=bind,src=\$AI_HOME/state,dst=/state,rw=true,bind-nonrecursive" "\${share_mounts[@]}" "\${secret_args[@]}" -e HOME=/state -e "TERM=\$TERM" -e LLAMA_CPP_BASE_URL=http://llama:8080 -w "\$container_workdir" localhost/omp:latest "\${omp_args[@]}"
+echo "[omp-ai] Shared router ready; persistent workbench active; session \$SESSION_ID"
+
+# The shell writes its container PID into the host-backed /state
+# before exec()ing OMP, so the reaper can terminate only a stale OMP process
+# without disturbing other live windows in the shared workbench.
+podman exec -it --workdir "\$container_workdir" "\${secret_args[@]}" \
+  -e HOME=/state -e "TERM=\$TERM" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
+  "\$WORKBENCH" /bin/bash -lc '
+    set -e
+    mkdir -p /state/runtime/omp-exec
+    printf "%s\n" "\$\$" > "/state/runtime/omp-exec/\$OMP_SESSION_ID.pid"
+    exec /usr/local/bin/omp "\$@"
+  ' bash "\${omp_args[@]}"
 EOT
 root chmod 0755 "$INNER"
 
@@ -580,8 +732,11 @@ INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"
 case "\${1:-}" in
   stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
   status|logs) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
-  update) shift; (( \$# == 0 )) || { echo "Usage: omp-ai update" >&2; exit 2; }; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
+  shell) sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$INNER" shell;;
+  reset-env) exec sudo -n -u "\$AI_USER" "\$INNER" reset-env;;
+  update) shift; (( \$# == 0 )) || { echo "Usage: omp-ai update" >&2; exit 2; }; sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
 esac
+sudo -n "\$SHARE_HELPER" prepare >/dev/null
 pwd_real="\$(realpath -m "\$PWD")"; rel=""; case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
 modes=(); paths=(); omp_args=(); while (( \$# )); do case "\$1" in --share) modes+=(rw); paths+=("\${2:?}"); shift 2;; --share-ro) modes+=(ro); paths+=("\${2:?}"); shift 2;; --) shift; omp_args+=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
 if (( \${#paths[@]} == 0 )); then exec sudo -n -u "\$AI_USER" "\$INNER" --workdir "\$rel" -- "\${omp_args[@]}"; fi
@@ -662,6 +817,7 @@ root systemctl daemon-reload; root systemctl enable --now omp-ai-reaper.timer
 mapfile -t old_agents < <(as_ai podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
 (( ${#old_agents[@]} )) && as_ai podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
 as_ai podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
+as_ai podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
 as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
 root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 
@@ -673,3 +829,4 @@ echo "Parallel slots:   $LLAMA_PARALLEL"
 echo "Context per slot: $LLAMA_CTX_PER_SLOT"
 echo
 echo "Next: ai-model add /path/model.gguf && omp-ai"
+echo "Persistent env: omp-ai shell  # Debian 12; apt installs survive restarts"

@@ -26,7 +26,7 @@ omp-ai
 
 ## Concurrent OMP windows
 
-Each `omp-ai` gets its own agent container, but all windows share one `ompai-llama` router.
+All `omp-ai` windows execute inside one persistent writable `ompai-workbench` container and share one `ompai-llama` router. The workbench is stopped when the last window closes, but its writable filesystem is kept on disk.
 
 Default:
 
@@ -65,11 +65,14 @@ It deliberately does **not** pass `--ctx-size`, so current llama.cpp can size th
 ## Lifecycle
 
 ```text
-first OMP window   -> starts shared llama router
-more OMP windows   -> reuse it
-one window closes  -> only its agent container is removed
-last window closes -> router stops and RAM/VRAM are released
+first OMP window   -> starts persistent workbench + shared llama router
+more OMP windows   -> podman exec into the same workbench; reuse router
+one window closes  -> only that OMP process exits
+last window closes -> workbench stops; router is removed; RAM/VRAM released
+next launch        -> same workbench rootfs starts again
 ```
+
+The stopped workbench consumes disk space but no model VRAM and essentially no runtime RAM/CPU.
 
 Useful commands:
 
@@ -77,9 +80,10 @@ Useful commands:
 omp-ai status
 omp-ai logs
 omp-ai stop
+omp-ai shell
 ```
 
-`omp-ai stop` stops all OMP windows and the shared router.
+`omp-ai shell` opens a shell inside the same persistent Debian environment OMP uses. `omp-ai stop` terminates all OMP windows, stops the workbench, and removes the shared llama router; it does **not** delete the workbench filesystem.
 
 ## Data
 
@@ -123,50 +127,86 @@ ai-model path
 
 ## Updating OMP
 
-The OMP agent container is read-only, so `omp update` inside OMP cannot replace `/usr/local/bin/omp`. Update the image from the host instead:
+The workbench root filesystem is writable, so `omp update` now works from inside OMP and survives a restart. For a host-side update with no active OMP windows, use:
 
 ```bash
 omp-ai update
 ```
 
-The command rebuilds only `localhost/omp:latest` from the official prebuilt OMP binary. It does **not** rerun pacman, NVIDIA setup, model imports, or the full installer. Close active OMP windows first; the updater refuses to run while agent sessions are active.
+If the persistent workbench already exists, this updates `/usr/local/bin/omp` **inside that same container** without touching packages you installed with `apt`, `pip`, `npm`, `cargo`, etc. If no workbench exists yet, it refreshes the base image from the official prebuilt OMP binary.
 
-If `OMP_VERSION` is empty in the installed configuration, `omp-ai update` fetches the latest stable release. If it is pinned, the command rebuilds that pinned version; change `OMP_VERSION` and rerun `setup-omp-ai.sh` to change the pin.
+If `OMP_VERSION` is pinned in the installed configuration, `omp-ai update` installs that pinned release; with an empty value it follows the current stable release.
 
-## Container persistence
+## Persistent workbench and package installation
 
-Each OMP window is an **ephemeral** Podman container created with `--rm` and a read-only root filesystem. Closing the window removes that container. Therefore system-level changes inside the container are not a persistence mechanism (and writes such as replacing `/usr/local/bin/omp` fail outright).
-
-What persists:
+The OMP environment is currently based on:
 
 ```text
-/workspace  -> host WORKSPACE (/srv/ompai/workspace by default)   persistent RW
-/state      -> AI_HOME/state                                     persistent RW
-/shares/... -> explicitly shared host paths                       persistent on host
-/models     -> model store, used by llama.cpp                     persistent, read-only to llama
+python:3.12-slim-bookworm
+        -> Debian 12 (Bookworm)
 ```
 
-What does not persist:
+So the system package manager is **APT**, not pacman. For example, the agent can run:
+
+```bash
+apt-get update
+apt-get install -y clang cmake ninja-build libsqlite3-dev
+```
+
+or install language tooling normally:
+
+```bash
+pip install ...
+npm install -g ...
+cargo install ...
+```
+
+Those changes are written to the `ompai-workbench` container's writable layer and remain there when the container is stopped and started again.
+
+Persistent areas now look like:
 
 ```text
-container root filesystem  read-only + container removed on exit
-/tmp                       tmpfs, disappears on exit
-/data                      tmpfs, disappears on exit
+ompai-workbench rootfs   persistent RW (apt/system tools live here)
+/workspace               host WORKSPACE, persistent RW
+/state                   AI_HOME/state, persistent RW
+/shares/...              temporary aliases to explicit direct shares
+/tmp                     tmpfs, intentionally ephemeral
 ```
 
-So if OMP writes config/session/plugin data under its HOME (`/state`) or files under `/workspace`, those changes survive. Installing an OS package or binary into the container root does not.
+The workbench is **not** removed on normal exit. It is merely stopped after the last OMP session closes. The llama.cpp container remains intentionally ephemeral/read-only and is removed after the last session so model RAM/VRAM is released.
+
+To inspect/install things manually in the same environment:
+
+```bash
+omp-ai shell
+```
+
+To deliberately throw away all workbench-level modifications and recreate a clean environment from `localhost/omp:latest` on the next launch:
+
+```bash
+omp-ai stop
+omp-ai reset-env
+```
+
+`reset-env` does not delete `/workspace`, `/state`, or your model store; it deletes only the persistent container writable layer, including packages installed with `apt`.
+
+### Persistence/security tradeoff
+
+This is intentionally less immutable than the old read-only agent container. If the agent installs a malicious package or modifies the OS, that modification can persist across OMP restarts. The host boundary is still rootless Podman under the dedicated `ompai` Unix account, but a persistent workbench should be treated like a development machine that the agent controls. `omp-ai reset-env` is the clean-slate escape hatch.
+
+Direct-share mounts still use temporary ACLs and root-staged bind mounts. Because concurrent OMP processes now share one workbench namespace, treat all simultaneously active OMP windows as belonging to the same trust domain; an agent that deliberately searches the staging area could potentially observe another active session's explicitly shared path.
 
 ## Security summary
 
 - dedicated locked host user `ompai`;
 - rootless Podman;
 - no Podman/Docker socket in OMP;
-- read-only container roots, dropped capabilities, `no-new-privileges`;
+- rootless persistent OMP workbench with `no-new-privileges`; llama.cpp remains read-only with dropped capabilities;
 - host-level memory/CPU/task limits via systemd;
 - normal `$HOME` can remain mode `0700`;
 - llama.cpp has no external Internet network;
 - OMP has Internet access for search/fetch;
-- only `~/AI` and explicit `--share` paths are exposed to the agent.
+- only the persistent workspace/state and explicit `--share` paths are exposed from the host; the workbench rootfs itself is agent-writable.
 
 This is container isolation, not a VM: the host kernel is still shared.
 
@@ -177,7 +217,7 @@ The installer is idempotent enough for normal maintenance. Re-running it updates
 
 ## OMP installation
 
-OMP is **not built from source**. The installer creates a small OCI runtime image and installs the official prebuilt OMP binary inside it with:
+OMP is **not built from source**. The installer creates a Debian 12 workbench base image and installs the official prebuilt OMP binary inside it with:
 
 ```bash
 curl -fsSL https://omp.sh/install | sh -s -- --binary
