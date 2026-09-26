@@ -21,6 +21,8 @@ LLAMA_PORT=18080
 VRAM_RESERVE_MIB=512
 LLAMA_LOG_VERBOSITY=4
 LLAMA_CACHE_RAM_MIB=0
+LLAMA_CACHE_TYPE_K="q8_0"
+LLAMA_CACHE_TYPE_V="q8_0"
 
 # Speculative decoding. Applied only to SPEC_TARGET_MODEL via llama router preset.
 SPEC_MODE="mtp"                 # none|mtp|dflash|ngram-mod
@@ -128,6 +130,7 @@ set_cfg(){
     LLAMA_CTX) warn "LLAMA_CTX is deprecated; treating it as LLAMA_CTX_TOTAL"; LLAMA_CTX_TOTAL="$v";;
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";; LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
+    LLAMA_CACHE_TYPE_K) LLAMA_CACHE_TYPE_K="$v";; LLAMA_CACHE_TYPE_V) LLAMA_CACHE_TYPE_V="$v";;
     SPEC_MODE) SPEC_MODE="${v,,}";; SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="$v";; SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="$v";;
     SPEC_DRAFT_N_MAX) SPEC_DRAFT_N_MAX="$v";; SPEC_DRAFT_P_MIN) SPEC_DRAFT_P_MIN="$v";; SPEC_DRAFT_NGL) SPEC_DRAFT_NGL="$v";; SPEC_DRAFT_CACHE_TYPE) SPEC_DRAFT_CACHE_TYPE="$v";;
     OMP_VERSION) OMP_VERSION="$v";;
@@ -203,6 +206,8 @@ case "$DRAFT_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "DRAFT_STORE must be out
 [[ "$LLAMA_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LLAMA_CTX_TOTAL >= 1024 )) || die "LLAMA_CTX_TOTAL must be >= 1024"
 [[ "$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || die "LLAMA_PARALLEL must be >= 1"
 [[ "$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || die "LLAMA_CACHE_RAM_MIB must be >= 0"
+case "$LLAMA_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid LLAMA_CACHE_TYPE_K";; esac
+case "$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid LLAMA_CACHE_TYPE_V";; esac
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
 [[ "$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || die "LLAMA_LOG_VERBOSITY must be 0..5"
 case "$SPEC_MODE" in none|mtp|dflash|ngram-mod) ;; *) die "SPEC_MODE must be none/mtp/dflash/ngram-mod";; esac
@@ -373,6 +378,8 @@ LLAMA_PARALLEL=$LLAMA_PARALLEL
 VRAM_RESERVE_MIB=$VRAM_RESERVE_MIB
 LLAMA_LOG_VERBOSITY=$LLAMA_LOG_VERBOSITY
 LLAMA_CACHE_RAM_MIB=$LLAMA_CACHE_RAM_MIB
+LLAMA_CACHE_TYPE_K=$LLAMA_CACHE_TYPE_K
+LLAMA_CACHE_TYPE_V=$LLAMA_CACHE_TYPE_V
 SPEC_MODE=$SPEC_MODE
 SPEC_TARGET_MODEL=$SPEC_TARGET_MODEL
 SPEC_DRAFT_FILE=$SPEC_DRAFT_FILE
@@ -385,7 +392,7 @@ LLAMA_MEM=$LLAMA_MEM
 EOT
 else
   log "Preserving live llama runtime config: $RUNTIME_CONFIG"
-  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB SPEC_MODE SPEC_TARGET_MODEL SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V SPEC_MODE SPEC_TARGET_MODEL SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
     if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
       printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
     fi
@@ -410,7 +417,10 @@ root find "$DRAFT_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-
 SECRET_ENV="$AI_HOME/secrets/omp.env"
 if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
 
-root tee "$AI_HOME/state/.omp/agent/config.yml" >/dev/null <<EOT
+OMP_NATIVE_CONFIG="$AI_HOME/state/.omp/agent/config.yml"
+if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$AI_HOME/state/.omp/agent/config.yaml" ]]; then
+  log "Creating initial OMP native config: $OMP_NATIVE_CONFIG"
+  root tee "$OMP_NATIVE_CONFIG" >/dev/null <<EOT
 tools:
   approvalMode: yolo
 web_search:
@@ -426,13 +436,16 @@ modelRoles:
 retry:
   fallbackChains:
 EOT
-if [[ -n "$WEB_SEARCH_FALLBACK" ]]; then root tee -a "$AI_HOME/state/.omp/agent/config.yml" >/dev/null <<EOT
+  if [[ -n "$WEB_SEARCH_FALLBACK" ]]; then root tee -a "$OMP_NATIVE_CONFIG" >/dev/null <<EOT
     web:
       - web/$WEB_SEARCH_FALLBACK
 EOT
-else root tee -a "$AI_HOME/state/.omp/agent/config.yml" >/dev/null <<'EOT'
+  else root tee -a "$OMP_NATIVE_CONFIG" >/dev/null <<'EOT'
     web: []
 EOT
+  fi
+else
+  log "Preserving OMP native config under $AI_HOME/state/.omp/agent/"
 fi
 root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
 root chmod -R go-rwx "$AI_HOME/state"
@@ -715,7 +728,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -737,6 +750,8 @@ load_runtime_config(){
       VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="\$value";;
       LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="\$value";;
       LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="\$value";;
+      LLAMA_CACHE_TYPE_K) LLAMA_CACHE_TYPE_K="\$value";;
+      LLAMA_CACHE_TYPE_V) LLAMA_CACHE_TYPE_V="\$value";;
       SPEC_MODE) SPEC_MODE="\${value,,}";;
       SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="\$value";;
       SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="\$value";;
@@ -761,6 +776,8 @@ load_runtime_config(){
   [[ "\$SPEC_DRAFT_NGL" == all || "\$SPEC_DRAFT_NGL" == auto || "\$SPEC_DRAFT_NGL" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: SPEC_DRAFT_NGL must be all/auto/integer" >&2; return 2; }
   case "\$SPEC_DRAFT_CACHE_TYPE" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid SPEC_DRAFT_CACHE_TYPE" >&2; return 2;; esac
   [[ "\$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: LLAMA_CACHE_RAM_MIB must be an integer" >&2; return 2; }
+  case "\$LLAMA_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid LLAMA_CACHE_TYPE_K" >&2; return 2;; esac
+  case "\$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid LLAMA_CACHE_TYPE_V" >&2; return 2;; esac
   [[ "\$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || { echo "[omp-ai] ERROR: MODELS_MAX must be >= 1" >&2; return 2; }
   [[ -n "\$LLAMA_MEM" && "\$LLAMA_MEM" != *[[:space:]]* ]] || { echo "[omp-ai] ERROR: invalid LLAMA_MEM" >&2; return 2; }
 }
@@ -821,6 +838,9 @@ stop_if_unused(){
 }
 make_models_preset(){
   local preset="\$XDG_RUNTIME_DIR/omp-ai-models.ini" draft type
+  # Assign before any early return (e.g. missing optional draft model),
+  # otherwise set -u would make start_router fail on LLAMA_MODELS_PRESET.
+  LLAMA_MODELS_PRESET="\$preset"
   printf 'version = 1\\n' >"\$preset"
   case "\$SPEC_MODE" in
     none) ;;
@@ -854,7 +874,6 @@ EOP
       ;;
   esac
   chmod 0600 "\$preset"
-  LLAMA_MODELS_PRESET="\$preset"
 }
 start_router(){
   if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
@@ -863,13 +882,13 @@ start_router(){
   echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx-total=\$LLAMA_CTX_TOTAL, spec=\$SPEC_MODE"
   pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" --mount "type=bind,src=\$DRAFT_STORE,dst=/drafts,ro=true,bind-nonrecursive" --mount "type=bind,src=\$LLAMA_MODELS_PRESET,dst=/config/models.ini,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
     --models-dir /models --models-preset /config/models.ini --models-max "\$MODELS_MAX" --models-autoload \
-    --host 0.0.0.0 --port 8080 \
+    --host 0.0.0.0 --port 8080 --metrics \
     --parallel "\$LLAMA_PARALLEL" \
     --cont-batching \
     --kv-unified \
     --ctx-size "\$LLAMA_CTX_TOTAL" \
     --cache-ram "\$LLAMA_CACHE_RAM_MIB" --no-cache-idle-slots \
-    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --cache-type-k "\$LLAMA_CACHE_TYPE_K" --cache-type-v "\$LLAMA_CACHE_TYPE_V" \
     --flash-attn auto --fit on --fit-target "\$VRAM_RESERVE_MIB" \
     --offline >/dev/null
   for _ in \$(seq 1 300); do healthy && return 0; [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break; sleep 1; done
@@ -890,8 +909,8 @@ kill_exec_session(){
 case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
-    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
-      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$LLAMA_CACHE_TYPE_K" "\$LLAMA_CACHE_TYPE_V" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
     exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
@@ -916,10 +935,30 @@ case "\${1:-}" in
   status)
     pctl ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | { head -n1; grep -E '^ompai-(llama|workbench)' || true; }
     shopt -s nullglob; m=("\$SESS_DIR"/*.session); shopt -u nullglob; echo "Active OMP sessions: \${#m[@]}"; exit 0;;
+  stats)
+    model="\${2:-\$SPEC_TARGET_MODEL}"
+    if ! healthy; then echo "[omp-ai] llama router is not running." >&2; exit 3; fi
+    metrics="\$(curl --connect-timeout 2 --max-time 5 -fsSG --data-urlencode "model=\$model" "http://127.0.0.1:\$LLAMA_PORT/metrics")" || {
+      echo "[omp-ai] ERROR: metrics endpoint unavailable for model: \$model" >&2; exit 4;
+    }
+    pred_n="\$(awk '/^llamacpp:tokens_predicted_total([ {]|\$)/ {print \$NF; exit}' <<<"\$metrics")"
+    pred_s="\$(awk '/^llamacpp:tokens_predicted_seconds_total([ {]|\$)/ {print \$NF; exit}' <<<"\$metrics")"
+    pp_n="\$(awk '/^llamacpp:prompt_tokens_total([ {]|\$)/ {print \$NF; exit}' <<<"\$metrics")"
+    pp_s="\$(awk '/^llamacpp:prompt_seconds_total([ {]|\$)/ {print \$NF; exit}' <<<"\$metrics")"
+    current="\$(awk '/^llamacpp:predicted_tokens_seconds([ {]|\$)/ {print \$NF; exit}' <<<"\$metrics")"
+    printf 'Model: %s\n' "\$model"
+    awk -v n="\${pred_n:-0}" -v t="\${pred_s:-0}" 'BEGIN { if (t+0>0) printf "Decode avg since load: %.2f tok/s (%s tokens / %.3f s)\n", n/t,n,t; else print "Decode avg since load: n/a" }'
+    awk -v n="\${pp_n:-0}" -v t="\${pp_s:-0}" 'BEGIN { if (t+0>0) printf "Prefill avg since load: %.2f tok/s (%s tokens / %.3f s)\n", n/t,n,t; else print "Prefill avg since load: n/a" }'
+    [[ -n "\$current" ]] && printf 'llama current-throughput gauge: %s tok/s\n' "\$current"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      echo 'NVIDIA:'
+      nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw --format=csv,noheader 2>/dev/null || true
+    fi
+    exit 0;;
   logs) shift; exec podman logs -f "\$LLAMA_NAME";;
   shell)
     ensure_workbench
-    set +e; podman exec -it "\$WORKBENCH" /bin/bash; rc=\$?; set -e
+    set +e; podman exec -it -e HOME=/state --workdir /workspace "\$WORKBENCH" /bin/bash; rc=\$?; set -e
     has_sessions || pctl stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
     exit "\$rc";;
   reset-env)
@@ -1012,6 +1051,7 @@ podman exec -it --workdir "\$container_workdir" "\${secret_args[@]}" \
   ' bash "\${omp_args[@]}"
 EOT
 root chmod 0755 "$INNER"
+root bash -n "$INNER"
 
 # ----- public wrapper -----
 PUBLIC="/usr/local/bin/omp-ai"
@@ -1021,7 +1061,7 @@ set -Eeuo pipefail
 INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 case "\${1:-}" in
   stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
-  status|logs) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
+  status|logs|stats) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
   config)
     shift
     case "\${1:-show}" in
