@@ -1041,8 +1041,10 @@ echo "[omp-ai] OMP compaction threshold: \$compact_at tokens (llama ctx-total=\$
 # The shell writes its container PID into the host-backed /state
 # before exec()ing OMP, so the reaper can terminate only a stale OMP process
 # without disturbing other live windows in the shared workbench.
-podman exec -it --workdir "\$container_workdir" "\${secret_args[@]}" \
-  -e HOME=/state -e "TERM=\$TERM" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
+exec_tty=()
+if [[ -t 0 && -t 1 ]]; then exec_tty=(-it); fi
+podman exec "\${exec_tty[@]}" --workdir "\$container_workdir" "\${secret_args[@]}" \
+  -e HOME=/state -e "TERM=\${TERM:-xterm}" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
   "\$WORKBENCH" /bin/bash -lc '
     set -e
     mkdir -p /state/runtime/omp-exec
