@@ -18,6 +18,7 @@ LLAMA_PARALLEL=2
 LLAMA_MEM="22g"
 LLAMA_PORT=18080
 VRAM_RESERVE_MIB=512
+LLAMA_LOG_VERBOSITY=4
 LLAMA_CACHE_RAM_MIB=0
 
 # Empty = latest stable release from the official OMP installer.
@@ -114,7 +115,7 @@ set_cfg(){
     LLAMA_CTX_TOTAL) LLAMA_CTX_TOTAL="$v";;
     LLAMA_CTX_PER_SLOT) warn "LLAMA_CTX_PER_SLOT is obsolete and ignored; use LLAMA_CTX_TOTAL (default: $LLAMA_CTX_TOTAL)";;
     LLAMA_CTX) warn "LLAMA_CTX is deprecated; treating it as LLAMA_CTX_TOTAL"; LLAMA_CTX_TOTAL="$v";;
-    LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";;
+    LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";; LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
     OMP_VERSION) OMP_VERSION="$v";;
     WORKBENCH_BASE_IMAGE) WORKBENCH_BASE_IMAGE="$v";;
@@ -160,6 +161,7 @@ while (($#)); do
     --ctx-per-slot) die "--ctx-per-slot was removed; use --ctx-total N";;
     --llama-parallel) LLAMA_PARALLEL="${2:?}"; shift 2;;
     --vram-reserve) VRAM_RESERVE_MIB="${2:?}"; shift 2;;
+    --llama-log-verbosity) LLAMA_LOG_VERBOSITY="${2:?}"; shift 2;;
     --llama-memory) LLAMA_MEM="${2:?}"; shift 2;;
     --omp-memory) OMP_MEM="${2:?}"; shift 2;;
     --workbench-base-image) WORKBENCH_BASE_IMAGE="${2:?}"; shift 2;;
@@ -185,6 +187,7 @@ case "$MODEL_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "MODEL_STORE must be out
 [[ "$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || die "LLAMA_PARALLEL must be >= 1"
 [[ "$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || die "LLAMA_CACHE_RAM_MIB must be >= 0"
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
+[[ "$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || die "LLAMA_LOG_VERBOSITY must be 0..5"
 [[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] || die "LLAMA_PORT must be an integer"
 [[ -n "$WORKBENCH_BASE_IMAGE" && "$WORKBENCH_BASE_IMAGE" != *[[:space:]]* ]] || die "WORKBENCH_BASE_IMAGE must be a non-empty image reference without whitespace"
 
@@ -341,13 +344,14 @@ if [[ ! -e "$RUNTIME_CONFIG" ]]; then
 LLAMA_CTX_TOTAL=$LLAMA_CTX_TOTAL
 LLAMA_PARALLEL=$LLAMA_PARALLEL
 VRAM_RESERVE_MIB=$VRAM_RESERVE_MIB
+LLAMA_LOG_VERBOSITY=$LLAMA_LOG_VERBOSITY
 LLAMA_CACHE_RAM_MIB=$LLAMA_CACHE_RAM_MIB
 MODELS_MAX=$MODELS_MAX
 LLAMA_MEM=$LLAMA_MEM
 EOT
 else
   log "Preserving live llama runtime config: $RUNTIME_CONFIG"
-  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_CACHE_RAM_MIB MODELS_MAX LLAMA_MEM; do
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB MODELS_MAX LLAMA_MEM; do
     if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
       printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
     fi
@@ -383,7 +387,6 @@ else root tee -a "$AI_HOME/state/.omp/agent/config.yml" >/dev/null <<'EOT'
     web: []
 EOT
 fi
-root rm -f "$AI_HOME/state/.omp/agent/models.yml"
 root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"; root chmod -R go-rwx "$AI_HOME/state"
 
 validate_model(){
@@ -655,7 +658,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -675,6 +678,7 @@ load_runtime_config(){
       LLAMA_CTX_TOTAL) LLAMA_CTX_TOTAL="\$value";;
       LLAMA_PARALLEL) LLAMA_PARALLEL="\$value";;
       VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="\$value";;
+      LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="\$value";;
       LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="\$value";;
       MODELS_MAX) MODELS_MAX="\$value";;
       LLAMA_MEM) LLAMA_MEM="\$value";;
@@ -684,6 +688,7 @@ load_runtime_config(){
   [[ "\$LLAMA_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LLAMA_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: LLAMA_CTX_TOTAL must be >= 1024" >&2; return 2; }
   [[ "\$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || { echo "[omp-ai] ERROR: LLAMA_PARALLEL must be >= 1" >&2; return 2; }
   [[ "\$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: VRAM_RESERVE_MIB must be an integer" >&2; return 2; }
+  [[ "\$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || { echo "[omp-ai] ERROR: LLAMA_LOG_VERBOSITY must be 0..5" >&2; return 2; }
   [[ "\$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: LLAMA_CACHE_RAM_MIB must be an integer" >&2; return 2; }
   [[ "\$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || { echo "[omp-ai] ERROR: MODELS_MAX must be >= 1" >&2; return 2; }
   [[ -n "\$LLAMA_MEM" && "\$LLAMA_MEM" != *[[:space:]]* ]] || { echo "[omp-ai] ERROR: invalid LLAMA_MEM" >&2; return 2; }
@@ -747,7 +752,7 @@ start_router(){
   if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
   pctl rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx-total=\$LLAMA_CTX_TOTAL"
-  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
+  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
     --models-dir /models --models-max "\$MODELS_MAX" --models-autoload \
     --host 0.0.0.0 --port 8080 \
     --parallel "\$LLAMA_PARALLEL" \
@@ -776,8 +781,8 @@ kill_exec_session(){
 case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
-    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_CACHE_RAM_MIB=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
-      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_CACHE_RAM_MIB" "\$MODELS_MAX" "\$LLAMA_MEM"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$MODELS_MAX" "\$LLAMA_MEM"
     exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
@@ -869,7 +874,21 @@ cleanup(){
 trap cleanup EXIT INT TERM HUP
 parent=\$\$; ( while kill -0 "\$parent" 2>/dev/null; do touch "\$MARKER" 2>/dev/null || exit 0; sleep 20; done ) & HB_PID=\$!
 secret_args=(); [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
+# Keep OMP compaction below this llama.cpp instance's real --ctx-size.  Runtime
+# discovery may otherwise advertise the model architecture's larger context.
+reserve=\$(( LLAMA_CTX_TOTAL * 15 / 100 ))
+(( reserve < 16384 )) && reserve=16384
+compact_at=\$(( LLAMA_CTX_TOTAL - reserve ))
+(( compact_at < 4096 )) && compact_at=4096
+OMP_RUNTIME_OVERLAY="/state/runtime/omp-runtime.yml"
+pctl exec "\$WORKBENCH" /bin/bash -lc "cat > '\$OMP_RUNTIME_OVERLAY' <<'YAML'
+compaction:
+  enabled: true
+  midTurnEnabled: true
+  thresholdTokens: \$compact_at
+YAML"
 echo "[omp-ai] Shared router ready; persistent workbench active; session \$SESSION_ID"
+echo "[omp-ai] OMP compaction threshold: \$compact_at tokens (llama ctx-total=\$LLAMA_CTX_TOTAL)"
 
 # The shell writes its container PID into the host-backed /state
 # before exec()ing OMP, so the reaper can terminate only a stale OMP process
@@ -880,7 +899,7 @@ podman exec -it --workdir "\$container_workdir" "\${secret_args[@]}" \
     set -e
     mkdir -p /state/runtime/omp-exec
     printf "%s\n" "\$\$" > "/state/runtime/omp-exec/\$OMP_SESSION_ID.pid"
-    exec /usr/local/bin/omp "\$@"
+    exec /usr/local/bin/omp --config /state/runtime/omp-runtime.yml "\$@"
   ' bash "\${omp_args[@]}"
 EOT
 root chmod 0755 "$INNER"
@@ -1008,6 +1027,7 @@ echo "Model store:      $MODEL_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
 echo "Initial context:   $LLAMA_CTX_TOTAL"
+echo "Llama verbosity:   $LLAMA_LOG_VERBOSITY"
 echo "Runtime config:    $RUNTIME_CONFIG"
 echo "Workbench base:   $WORKBENCH_BASE_IMAGE"
 echo

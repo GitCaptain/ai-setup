@@ -33,17 +33,17 @@ Default:
 ```ini
 MODELS_MAX=1
 LLAMA_PARALLEL=2
-LLAMA_CTX_TOTAL=32768
+LLAMA_CTX_TOTAL=65536
 ```
 
 Meaning:
 
 - one model instance resident at a time;
 - two simultaneous inference slots;
-- a fixed 32768-token shared KV/context pool for the loaded model;
+- a fixed 65536-token shared KV/context pool for the loaded model;
 - continuous batching is enabled;
 - unified KV is enabled;
-- the 32768-token pool is shared dynamically by active parallel requests and is not multiplied by the slot count.
+- the 65536-token pool is shared dynamically by active parallel requests and is not multiplied by the slot count.
 
 The launcher passes:
 
@@ -51,12 +51,36 @@ The launcher passes:
 --parallel 2
 --cont-batching
 --kv-unified
---ctx-size 32768
+--ctx-size 65536
 ```
 
-`--ctx-size` now fixes the **total** shared KV pool. With one active request, that request may use most of the pool; with two active requests, both share the same pool dynamically. It is not a hard 16K/16K partition.
+`--ctx-size` now fixes the **total** shared KV pool. With one active request, that request may use most of the pool; with two active requests, both share the same pool dynamically. It is not a hard per-slot partition.
 
 `LLAMA_CTX` is still accepted as a deprecated alias for `LLAMA_CTX_TOTAL`. The old `LLAMA_CTX_PER_SLOT` config key is ignored with a warning so an old config cannot accidentally multiply the KV pool again.
+
+### Live llama tuning
+
+The installer now creates a separate live runtime file:
+
+```text
+/var/lib/ompai/config/runtime.conf
+```
+
+Show or edit it with:
+
+```bash
+omp-ai config
+omp-ai config edit
+```
+
+It contains only non-secret llama runtime knobs such as `LLAMA_CTX_TOTAL`, `LLAMA_PARALLEL`, `VRAM_RESERVE_MIB`, `LLAMA_CACHE_RAM_MIB`, `MODELS_MAX`, and `LLAMA_MEM`. The launcher reads this file every time it starts, so changing these values no longer requires re-running `setup-omp-ai.sh`. Apply a changed llama setting with:
+
+```bash
+omp-ai stop
+omp-ai -c   # or omp-ai / omp-ai -r
+```
+
+`omp-ai.conf` remains the installer/static configuration and seeds the live runtime file only when that file does not yet exist; rerunning setup preserves `/var/lib/ompai/config/runtime.conf`.
 
 ### Prompt-cache safety
 
@@ -239,12 +263,12 @@ This is container isolation, not a VM: the host kernel is still shared.
 
 ## Re-running setup
 
-The installer is idempotent enough for normal maintenance. Re-running it updates helpers/config/builds and force-stops currently active OMP sessions while doing so.
+The installer is idempotent enough for normal maintenance. Re-running it does not delete OMP session history. If an OMP window is active, setup leaves the running workbench/router/session markers alone; newly installed helpers take effect on the next launch.
 
 
 ## OMP installation
 
-OMP is **not built from source**. The installer creates a Debian 12 workbench base image and installs the official prebuilt OMP binary inside it with:
+OMP is **not built from source**. The installer creates a Debian 13 workbench base image and installs the official prebuilt OMP binary inside it with:
 
 ```bash
 curl -fsSL https://omp.sh/install | sh -s -- --binary
@@ -268,3 +292,12 @@ bash setup-omp-ai.sh
 ```
 
 `omp-ai stop` has bounded lock/runtime timeouts and should return instead of waiting indefinitely.
+
+
+### llama.cpp trace logging and context guard
+
+`LLAMA_LOG_VERBOSITY=4` is read live from `$AI_HOME/config/runtime.conf` and passed into the llama.cpp container as `LLAMA_ARG_LOG_VERBOSITY`, so router-spawned model servers inherit it.
+
+Each `omp-ai` launch injects `/state/runtime/omp-runtime.yml` as a one-shot OMP config overlay. Its `compaction.thresholdTokens` is derived from `LLAMA_CTX_TOTAL`, reserving at least 16K tokens (or 15%, whichever is larger), so OMP compacts before the local llama.cpp hard context limit.
+
+`~/.omp/agent/models.yml` is preserved across setup reruns so per-model `compactionModel` overrides survive maintenance.
