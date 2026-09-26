@@ -33,17 +33,17 @@ Default:
 ```ini
 MODELS_MAX=1
 LLAMA_PARALLEL=2
-LLAMA_CTX_PER_SLOT=8192
+LLAMA_CTX_TOTAL=32768
 ```
 
 Meaning:
 
 - one model instance resident at a time;
 - two simultaneous inference slots;
-- up to 8192 tokens of context per slot;
+- a fixed 32768-token shared KV/context pool for the loaded model;
 - continuous batching is enabled;
 - unified KV is enabled;
-- total KV pool is auto-sized by llama.cpp as `parallel × context-per-slot`.
+- the 32768-token pool is shared dynamically by active parallel requests and is not multiplied by the slot count.
 
 The launcher passes:
 
@@ -51,12 +51,12 @@ The launcher passes:
 --parallel 2
 --cont-batching
 --kv-unified
---kv-unified-per-slot 8192
+--ctx-size 32768
 ```
 
-It deliberately does **not** pass `--ctx-size`, so current llama.cpp can size the shared KV pool from the per-slot value.
+`--ctx-size` now fixes the **total** shared KV pool. With one active request, that request may use most of the pool; with two active requests, both share the same pool dynamically. It is not a hard 16K/16K partition.
 
-`LLAMA_CTX` is still accepted by the installer as a deprecated alias for `LLAMA_CTX_PER_SLOT`.
+`LLAMA_CTX` is still accepted as a deprecated alias for `LLAMA_CTX_TOTAL`. The old `LLAMA_CTX_PER_SLOT` config key is ignored with a warning so an old config cannot accidentally multiply the KV pool again.
 
 ### Prompt-cache safety
 
@@ -257,3 +257,14 @@ OMP_VERSION=v18.1.15
 ```
 
 Older versions of this setup cloned OMP into `/var/lib/ompai/src/oh-my-pi`; the installer now removes that obsolete checkout on rerun.
+
+
+### After updating the installer itself
+
+`setup-omp-ai.sh` generates `/usr/local/bin/omp-ai` and its helpers. After downloading a newer installer, run it once so new subcommands such as `reset-env` are installed on the host:
+
+```bash
+bash setup-omp-ai.sh
+```
+
+`omp-ai stop` has bounded lock/runtime timeouts and should return instead of waiting indefinitely.
