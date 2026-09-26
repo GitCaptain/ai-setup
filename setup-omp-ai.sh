@@ -209,6 +209,9 @@ root usermod -aG "$SHARE_GROUP" "$AI_USER"; root usermod -aG "$SHARE_GROUP" "$MA
 AI_UID="$(id -u "$AI_USER")"; AI_GID="$(id -g "$AI_USER")"; MAIN_UID="$(id -u "$MAIN_USER")"; MAIN_GID="$(id -g "$MAIN_USER")"
 root chown "$AI_USER:$AI_GID" "$AI_HOME"
 root chmod 0700 "$AI_HOME"
+# MAIN_USER may traverse AI_HOME only to subtrees explicitly granted below.
+# This does not make secrets/config/src/build listable or readable.
+root setfacl -m "u:$MAIN_USER:--x" "$AI_HOME"
 
 if (( HARDEN_HOME )); then
   mode="$(stat -c %a "$MAIN_HOME")"
@@ -360,6 +363,13 @@ fi
 root chown root:"$AI_GID" "$RUNTIME_CONFIG"
 root chmod 0640 "$RUNTIME_CONFIG"
 root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE"
+# Model-store invariant: MAIN_USER can manage models directly; ompai can only read.
+# The llama container additionally mounts this tree read-only.
+root chgrp -R "$AI_GID" "$MODEL_STORE"
+root find "$MODEL_STORE" -type d -exec chmod g+rx,g-w,o-rwx,g+s {} +
+root find "$MODEL_STORE" -type f -exec chmod g+r,g-w,o-rwx {} +
+root find "$MODEL_STORE" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
+root find "$MODEL_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
 SECRET_ENV="$AI_HOME/secrets/omp.env"
 if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
 
@@ -387,7 +397,12 @@ else root tee -a "$AI_HOME/state/.omp/agent/config.yml" >/dev/null <<'EOT'
     web: []
 EOT
 fi
-root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"; root chmod -R go-rwx "$AI_HOME/state"
+root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
+root chmod -R go-rwx "$AI_HOME/state"
+# Access invariant for agent-visible state: MAIN_USER >= ompai.
+# OMP writes /state; the desktop user can inspect/edit the same files directly.
+root setfacl -R -m "u:$MAIN_USER:rwX" "$AI_HOME/state"
+root find "$AI_HOME/state" -type d -exec setfacl -m "d:u:$MAIN_USER:rwx,d:m:rwx" {} +
 
 validate_model(){
   local src="$1" f found=0
@@ -405,7 +420,12 @@ for raw in "${INITIAL_MODELS[@]}"; do
   tmp="$MODEL_STORE/.import-$name.$$"; root rm -rf "$tmp"
   [[ -f "$src" ]] && root cp --reflink=auto --sparse=always "$src" "$tmp" || root cp -a --reflink=auto "$src" "$tmp"
   root chown -R root:"$AI_GID" "$tmp"
-  [[ -d "$tmp" ]] && { root find "$tmp" -type d -exec chmod 0550 {} +; root find "$tmp" -type f -exec chmod 0440 {} +; } || root chmod 0440 "$tmp"
+  [[ -d "$tmp" ]] && {
+    root find "$tmp" -type d -exec chmod 2550 {} +
+    root find "$tmp" -type f -exec chmod 0440 {} +
+    root find "$tmp" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
+    root find "$tmp" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
+  } || { root chmod 0440 "$tmp"; root setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" "$tmp"; }
   root mv "$tmp" "$dest"
 done
 
@@ -948,7 +968,8 @@ cd "\$AI_HOME"
 cmd="\${1:-help}"; shift || true
 idle(){ runuser -u "\$AI_USER" -- env HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" podman ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^ompai-(agent-|llama$)' && { echo "Stop omp-ai before changing models" >&2; exit 3; } || true; }
 validate(){ local src="\$1" f found=0; runuser -u "\$MAIN_USER" -- test -r "\$src" || return 1; if [[ -f "\$src" ]]; then [[ "\${src,,}" == *.gguf && "\$(runuser -u "\$MAIN_USER" -- head -c4 "\$src")" == GGUF ]]; return; fi; [[ -d "\$src" ]] || return 1; find "\$src" -type l -print -quit | grep -q . && return 1; while IFS= read -r -d '' f; do found=1; [[ "\$(runuser -u "\$MAIN_USER" -- head -c4 "\$f")" == GGUF ]] || return 1; done < <(find "\$src" -type f -iname '*.gguf' -print0); (( found )); }
-install_one(){ local mode="\$1" raw="\$2" src name dest tmp; src="\$(realpath -e -- "\$raw")"; validate "\$src" || { echo "Invalid GGUF source" >&2; exit 2; }; name="\$(basename "\$src")"; dest="\$STORE/\$name"; [[ ! -e "\$dest" || "\$mode" == replace ]] || { echo "Exists: \$name" >&2; exit 2; }; [[ "\$mode" == replace ]] && rm -rf -- "\$dest"; tmp="\$STORE/.import-\$name.\$\$"; rm -rf "\$tmp"; [[ -f "\$src" ]] && cp --reflink=auto --sparse=always "\$src" "\$tmp" || cp -a --reflink=auto "\$src" "\$tmp"; chown -R root:"\$AI_GID" "\$tmp"; [[ -d "\$tmp" ]] && { find "\$tmp" -type d -exec chmod 0550 {} +; find "\$tmp" -type f -exec chmod 0440 {} +; } || chmod 0440 "\$tmp"; mv "\$tmp" "\$dest"; echo "Installed: \$name"; }
+grant_main(){ local p="\$1"; if [[ -d "\$p" ]]; then find "\$p" -type d -exec chmod 2550 {} +; find "\$p" -type f -exec chmod 0440 {} +; find "\$p" -type d -exec setfacl -m "u:\$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:\$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +; find "\$p" -type f -exec setfacl -m "u:\$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +; else chmod 0440 "\$p"; setfacl -m "u:\$MAIN_USER:rw-,g::r--,m:rw-,o::---" "\$p"; fi; }
+install_one(){ local mode="\$1" raw="\$2" src name dest tmp; src="\$(realpath -e -- "\$raw")"; validate "\$src" || { echo "Invalid GGUF source" >&2; exit 2; }; name="\$(basename "\$src")"; dest="\$STORE/\$name"; [[ ! -e "\$dest" || "\$mode" == replace ]] || { echo "Exists: \$name" >&2; exit 2; }; [[ "\$mode" == replace ]] && rm -rf -- "\$dest"; tmp="\$STORE/.import-\$name.\$\$"; rm -rf "\$tmp"; [[ -f "\$src" ]] && cp --reflink=auto --sparse=always "\$src" "\$tmp" || cp -a --reflink=auto "\$src" "\$tmp"; chown -R root:"\$AI_GID" "\$tmp"; grant_main "\$tmp"; mv "\$tmp" "\$dest"; echo "Installed: \$name"; }
 case "\$cmd" in add|replace) idle; (( \$# )) || exit 2; for x in "\$@"; do install_one "\$cmd" "\$x"; done;; remove|rm) idle; for n in "\$@"; do [[ "\$n" != */* ]] || exit 2; rm -rf -- "\$STORE/\$n"; done;; list|ls) find "\$STORE" -mindepth 1 -maxdepth 1 ! -name '.import-*' -printf '%f\n' | sort;; path) echo "\$STORE";; *) echo "Usage: ai-model {add|replace|remove|list|path} ...";; esac
 EOT
 root chmod 0755 "$MODEL_HELPER"
