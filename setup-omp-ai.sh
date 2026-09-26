@@ -10,6 +10,7 @@ AI_HOME="/var/lib/ompai"
 SHARE_GROUP="ompai-share"
 WORKSPACE="/srv/ompai/workspace"
 MODEL_STORE="/var/lib/ompai/models"
+DRAFT_STORE=""  # empty => $AI_HOME/drafts
 
 LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
 MODELS_MAX=1
@@ -20,6 +21,15 @@ LLAMA_PORT=18080
 VRAM_RESERVE_MIB=512
 LLAMA_LOG_VERBOSITY=4
 LLAMA_CACHE_RAM_MIB=0
+
+# Speculative decoding. Applied only to SPEC_TARGET_MODEL via llama router preset.
+SPEC_MODE="mtp"                 # none|mtp|dflash|ngram-mod
+SPEC_TARGET_MODEL="Qwen3.8-27B-Q4_K_M"
+SPEC_DRAFT_FILE="mtp-Qwen3.8-27B-Q4_0.gguf"
+SPEC_DRAFT_N_MAX=4
+SPEC_DRAFT_P_MIN="0.8"
+SPEC_DRAFT_NGL="all"
+SPEC_DRAFT_CACHE_TYPE="q4_0"
 
 # Empty = latest stable release from the official OMP installer.
 # You may pin a release tag, e.g. OMP_VERSION=v18.1.15.
@@ -63,6 +73,7 @@ Overrides:
   --config PATH
   --model PATH                 import GGUF/bundle; repeatable
   --model-store PATH
+  --draft-store PATH
   --models-max N
   --ctx-total N                total shared KV context across all parallel slots
   --ctx N                      alias for --ctx-total
@@ -110,13 +121,15 @@ set_cfg(){
   local k="$1" v="$2"
   case "$k" in
     AI_USER) AI_USER="$v";; AI_HOME) AI_HOME="$v";; SHARE_GROUP) SHARE_GROUP="$v";; WORKSPACE) WORKSPACE="$v";;
-    MODEL_STORE) MODEL_STORE="$v";; MODEL|MODEL_PATH) [[ -n "$v" ]] && INITIAL_MODELS+=("$v");;
+    MODEL_STORE) MODEL_STORE="$v";; DRAFT_STORE) DRAFT_STORE="$v";; MODEL|MODEL_PATH) [[ -n "$v" ]] && INITIAL_MODELS+=("$v");;
     MODELS_MAX) MODELS_MAX="$v";; LLAMA_IMAGE) LLAMA_IMAGE="$v";; LLAMA_PORT) LLAMA_PORT="$v";;
     LLAMA_CTX_TOTAL) LLAMA_CTX_TOTAL="$v";;
     LLAMA_CTX_PER_SLOT) warn "LLAMA_CTX_PER_SLOT is obsolete and ignored; use LLAMA_CTX_TOTAL (default: $LLAMA_CTX_TOTAL)";;
     LLAMA_CTX) warn "LLAMA_CTX is deprecated; treating it as LLAMA_CTX_TOTAL"; LLAMA_CTX_TOTAL="$v";;
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";; LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
+    SPEC_MODE) SPEC_MODE="${v,,}";; SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="$v";; SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="$v";;
+    SPEC_DRAFT_N_MAX) SPEC_DRAFT_N_MAX="$v";; SPEC_DRAFT_P_MIN) SPEC_DRAFT_P_MIN="$v";; SPEC_DRAFT_NGL) SPEC_DRAFT_NGL="$v";; SPEC_DRAFT_CACHE_TYPE) SPEC_DRAFT_CACHE_TYPE="$v";;
     OMP_VERSION) OMP_VERSION="$v";;
     WORKBENCH_BASE_IMAGE) WORKBENCH_BASE_IMAGE="$v";;
     OMP_REPO) warn "OMP_REPO is deprecated and ignored; OMP is installed from the official binary installer";;
@@ -156,6 +169,7 @@ while (($#)); do
     --config|--config=*) [[ "$1" == --config ]] && shift 2 || shift;;
     --model) INITIAL_MODELS+=("${2:?}"); shift 2;;
     --model-store) MODEL_STORE="${2:?}"; shift 2;;
+    --draft-store) DRAFT_STORE="${2:?}"; shift 2;;
     --models-max) MODELS_MAX="${2:?}"; shift 2;;
     --ctx-total|--ctx) LLAMA_CTX_TOTAL="${2:?}"; shift 2;;
     --ctx-per-slot) die "--ctx-per-slot was removed; use --ctx-total N";;
@@ -177,10 +191,13 @@ HARDEN_HOME="$(bool01 "$HARDEN_HOME")"; ASSUME_YES="$(bool01 "$ASSUME_YES")"
 # Live runtime tuning belongs to the isolated AI home, not the host-wide /etc tree.
 # Compute this only after omp-ai.conf/CLI overrides have finalized AI_HOME.
 RUNTIME_CONFIG="$AI_HOME/config/runtime.conf"
+[[ -n "$DRAFT_STORE" ]] || DRAFT_STORE="$AI_HOME/drafts"
 source /etc/os-release
 [[ "${ID:-}" == arch ]] || die "This installer targets Arch Linux."
 [[ "$MODEL_STORE" = /* && "$MODEL_STORE" != / ]] || die "MODEL_STORE must be an absolute non-root path"
+[[ "$DRAFT_STORE" = /* && "$DRAFT_STORE" != / ]] || die "DRAFT_STORE must be an absolute non-root path"
 case "$MODEL_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "MODEL_STORE must be outside $MAIN_HOME";; esac
+case "$DRAFT_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "DRAFT_STORE must be outside $MAIN_HOME";; esac
 [[ "$WORKSPACE" = /* && "$WORKSPACE" != / ]] || die "WORKSPACE must be an absolute non-root path"
 [[ "$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || die "MODELS_MAX must be >= 1"
 [[ "$LLAMA_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LLAMA_CTX_TOTAL >= 1024 )) || die "LLAMA_CTX_TOTAL must be >= 1024"
@@ -188,6 +205,13 @@ case "$MODEL_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "MODEL_STORE must be out
 [[ "$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || die "LLAMA_CACHE_RAM_MIB must be >= 0"
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
 [[ "$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || die "LLAMA_LOG_VERBOSITY must be 0..5"
+case "$SPEC_MODE" in none|mtp|dflash|ngram-mod) ;; *) die "SPEC_MODE must be none/mtp/dflash/ngram-mod";; esac
+[[ -n "$SPEC_TARGET_MODEL" && "$SPEC_TARGET_MODEL" != *']'* && "$SPEC_TARGET_MODEL" != *$'\n'* ]] || die "Invalid SPEC_TARGET_MODEL"
+[[ -n "$SPEC_DRAFT_FILE" && "$SPEC_DRAFT_FILE" != */* && "$SPEC_DRAFT_FILE" != .* ]] || die "SPEC_DRAFT_FILE must be a basename"
+[[ "$SPEC_DRAFT_N_MAX" =~ ^[0-9]+$ ]] && (( SPEC_DRAFT_N_MAX >= 1 && SPEC_DRAFT_N_MAX <= 32 )) || die "SPEC_DRAFT_N_MAX must be 1..32"
+[[ "$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || die "SPEC_DRAFT_P_MIN must be 0..1"
+[[ "$SPEC_DRAFT_NGL" == all || "$SPEC_DRAFT_NGL" == auto || "$SPEC_DRAFT_NGL" =~ ^[0-9]+$ ]] || die "SPEC_DRAFT_NGL must be all/auto/integer"
+case "$SPEC_DRAFT_CACHE_TYPE" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid SPEC_DRAFT_CACHE_TYPE";; esac
 [[ "$LLAMA_PORT" =~ ^[0-9]+$ ]] || die "LLAMA_PORT must be an integer"
 [[ -n "$WORKBENCH_BASE_IMAGE" && "$WORKBENCH_BASE_IMAGE" != *[[:space:]]* ]] || die "WORKBENCH_BASE_IMAGE must be a non-empty image reference without whitespace"
 
@@ -349,12 +373,19 @@ LLAMA_PARALLEL=$LLAMA_PARALLEL
 VRAM_RESERVE_MIB=$VRAM_RESERVE_MIB
 LLAMA_LOG_VERBOSITY=$LLAMA_LOG_VERBOSITY
 LLAMA_CACHE_RAM_MIB=$LLAMA_CACHE_RAM_MIB
+SPEC_MODE=$SPEC_MODE
+SPEC_TARGET_MODEL=$SPEC_TARGET_MODEL
+SPEC_DRAFT_FILE=$SPEC_DRAFT_FILE
+SPEC_DRAFT_N_MAX=$SPEC_DRAFT_N_MAX
+SPEC_DRAFT_P_MIN=$SPEC_DRAFT_P_MIN
+SPEC_DRAFT_NGL=$SPEC_DRAFT_NGL
+SPEC_DRAFT_CACHE_TYPE=$SPEC_DRAFT_CACHE_TYPE
 MODELS_MAX=$MODELS_MAX
 LLAMA_MEM=$LLAMA_MEM
 EOT
 else
   log "Preserving live llama runtime config: $RUNTIME_CONFIG"
-  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB MODELS_MAX LLAMA_MEM; do
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB SPEC_MODE SPEC_TARGET_MODEL SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
     if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
       printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
     fi
@@ -362,7 +393,7 @@ else
 fi
 root chown root:"$AI_GID" "$RUNTIME_CONFIG"
 root chmod 0640 "$RUNTIME_CONFIG"
-root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE"
+root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE" "$DRAFT_STORE"
 # Model-store invariant: MAIN_USER can manage models directly; ompai can only read.
 # The llama container additionally mounts this tree read-only.
 root chgrp -R "$AI_GID" "$MODEL_STORE"
@@ -370,6 +401,12 @@ root find "$MODEL_STORE" -type d -exec chmod g+rx,g-w,o-rwx,g+s {} +
 root find "$MODEL_STORE" -type f -exec chmod g+r,g-w,o-rwx {} +
 root find "$MODEL_STORE" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
 root find "$MODEL_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
+# Draft-store invariant is the same as model-store: desktop user RW, ompai read-only.
+root chgrp -R "$AI_GID" "$DRAFT_STORE"
+root find "$DRAFT_STORE" -type d -exec chmod g+rx,g-w,o-rwx,g+s {} +
+root find "$DRAFT_STORE" -type f -exec chmod g+r,g-w,o-rwx {} +
+root find "$DRAFT_STORE" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
+root find "$DRAFT_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
 SECRET_ENV="$AI_HOME/secrets/omp.env"
 if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
 
@@ -678,7 +715,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -700,6 +737,13 @@ load_runtime_config(){
       VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="\$value";;
       LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="\$value";;
       LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="\$value";;
+      SPEC_MODE) SPEC_MODE="\${value,,}";;
+      SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="\$value";;
+      SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="\$value";;
+      SPEC_DRAFT_N_MAX) SPEC_DRAFT_N_MAX="\$value";;
+      SPEC_DRAFT_P_MIN) SPEC_DRAFT_P_MIN="\$value";;
+      SPEC_DRAFT_NGL) SPEC_DRAFT_NGL="\$value";;
+      SPEC_DRAFT_CACHE_TYPE) SPEC_DRAFT_CACHE_TYPE="\$value";;
       MODELS_MAX) MODELS_MAX="\$value";;
       LLAMA_MEM) LLAMA_MEM="\$value";;
       *) echo "[omp-ai] ERROR: unsupported live runtime key: \$key" >&2; return 2;;
@@ -709,6 +753,13 @@ load_runtime_config(){
   [[ "\$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || { echo "[omp-ai] ERROR: LLAMA_PARALLEL must be >= 1" >&2; return 2; }
   [[ "\$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: VRAM_RESERVE_MIB must be an integer" >&2; return 2; }
   [[ "\$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || { echo "[omp-ai] ERROR: LLAMA_LOG_VERBOSITY must be 0..5" >&2; return 2; }
+  case "\$SPEC_MODE" in none|mtp|dflash|ngram-mod) ;; *) echo "[omp-ai] ERROR: SPEC_MODE must be none/mtp/dflash/ngram-mod" >&2; return 2;; esac
+  [[ -n "\$SPEC_TARGET_MODEL" && "\$SPEC_TARGET_MODEL" != *']'* && "\$SPEC_TARGET_MODEL" != *$'\\n'* ]] || { echo "[omp-ai] ERROR: invalid SPEC_TARGET_MODEL" >&2; return 2; }
+  [[ -n "\$SPEC_DRAFT_FILE" && "\$SPEC_DRAFT_FILE" != */* && "\$SPEC_DRAFT_FILE" != .* ]] || { echo "[omp-ai] ERROR: SPEC_DRAFT_FILE must be a basename" >&2; return 2; }
+  [[ "\$SPEC_DRAFT_N_MAX" =~ ^[0-9]+$ ]] && (( SPEC_DRAFT_N_MAX >= 1 && SPEC_DRAFT_N_MAX <= 32 )) || { echo "[omp-ai] ERROR: SPEC_DRAFT_N_MAX must be 1..32" >&2; return 2; }
+  [[ "\$SPEC_DRAFT_P_MIN" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || { echo "[omp-ai] ERROR: SPEC_DRAFT_P_MIN must be 0..1" >&2; return 2; }
+  [[ "\$SPEC_DRAFT_NGL" == all || "\$SPEC_DRAFT_NGL" == auto || "\$SPEC_DRAFT_NGL" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: SPEC_DRAFT_NGL must be all/auto/integer" >&2; return 2; }
+  case "\$SPEC_DRAFT_CACHE_TYPE" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid SPEC_DRAFT_CACHE_TYPE" >&2; return 2;; esac
   [[ "\$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: LLAMA_CACHE_RAM_MIB must be an integer" >&2; return 2; }
   [[ "\$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || { echo "[omp-ai] ERROR: MODELS_MAX must be >= 1" >&2; return 2; }
   [[ -n "\$LLAMA_MEM" && "\$LLAMA_MEM" != *[[:space:]]* ]] || { echo "[omp-ai] ERROR: invalid LLAMA_MEM" >&2; return 2; }
@@ -768,12 +819,50 @@ stop_if_unused(){
     pctl rm -f -t 10 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   fi
 }
+make_models_preset(){
+  local preset="\$XDG_RUNTIME_DIR/omp-ai-models.ini" draft type
+  printf 'version = 1\\n' >"\$preset"
+  case "\$SPEC_MODE" in
+    none) ;;
+    ngram-mod)
+      cat >>"\$preset" <<EOP
+
+[\$SPEC_TARGET_MODEL]
+spec-type = ngram-mod
+EOP
+      ;;
+    mtp|dflash)
+      draft="\$DRAFT_STORE/\$SPEC_DRAFT_FILE"
+      [[ -r "\$draft" ]] || {
+        echo "[omp-ai] WARNING: speculative draft not found: \$draft; starting without speculative decoding." >&2
+        echo "[omp-ai] Download it, then restart with: omp-ai stop && omp-ai -c" >&2
+        return 0
+      }
+      [[ "\$(head -c4 "\$draft" 2>/dev/null || true)" == GGUF ]] || { echo "[omp-ai] ERROR: invalid draft GGUF: \$draft" >&2; return 4; }
+      [[ "\$SPEC_MODE" == mtp ]] && type=draft-mtp || type=draft-dflash
+      cat >>"\$preset" <<EOP
+
+[\$SPEC_TARGET_MODEL]
+spec-type = \$type
+spec-draft-model = /drafts/\$SPEC_DRAFT_FILE
+spec-draft-ngl = \$SPEC_DRAFT_NGL
+spec-draft-n-max = \$SPEC_DRAFT_N_MAX
+spec-draft-p-min = \$SPEC_DRAFT_P_MIN
+cache-type-k-draft = \$SPEC_DRAFT_CACHE_TYPE
+cache-type-v-draft = \$SPEC_DRAFT_CACHE_TYPE
+EOP
+      ;;
+  esac
+  chmod 0600 "\$preset"
+  LLAMA_MODELS_PRESET="\$preset"
+}
 start_router(){
   if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
   pctl rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
-  echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx-total=\$LLAMA_CTX_TOTAL"
-  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
-    --models-dir /models --models-max "\$MODELS_MAX" --models-autoload \
+  make_models_preset || return \$?
+  echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx-total=\$LLAMA_CTX_TOTAL, spec=\$SPEC_MODE"
+  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" --mount "type=bind,src=\$DRAFT_STORE,dst=/drafts,ro=true,bind-nonrecursive" --mount "type=bind,src=\$LLAMA_MODELS_PRESET,dst=/config/models.ini,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
+    --models-dir /models --models-preset /config/models.ini --models-max "\$MODELS_MAX" --models-autoload \
     --host 0.0.0.0 --port 8080 \
     --parallel "\$LLAMA_PARALLEL" \
     --cont-batching \
@@ -801,8 +890,8 @@ kill_exec_session(){
 case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
-    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
-      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$MODELS_MAX" "\$LLAMA_MEM"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
     exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
@@ -1045,10 +1134,12 @@ root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 ok "Setup complete"
 echo "Workspace:        $WORKSPACE"
 echo "Model store:      $MODEL_STORE"
+echo "Draft store:      $DRAFT_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
 echo "Initial context:   $LLAMA_CTX_TOTAL"
 echo "Llama verbosity:   $LLAMA_LOG_VERBOSITY"
+echo "Speculative:      $SPEC_MODE ($SPEC_TARGET_MODEL)"
 echo "Runtime config:    $RUNTIME_CONFIG"
 echo "Workbench base:   $WORKBENCH_BASE_IMAGE"
 echo
