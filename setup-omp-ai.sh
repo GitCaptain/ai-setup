@@ -13,11 +13,11 @@ MODEL_STORE="/var/lib/ompai/models"
 
 LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
 MODELS_MAX=1
-LLAMA_CTX_TOTAL=32768
+LLAMA_CTX_TOTAL=65536
 LLAMA_PARALLEL=2
 LLAMA_MEM="22g"
 LLAMA_PORT=18080
-VRAM_RESERVE_MIB=2048
+VRAM_RESERVE_MIB=512
 LLAMA_CACHE_RAM_MIB=0
 
 # Empty = latest stable release from the official OMP installer.
@@ -39,6 +39,8 @@ INITIAL_MODELS=()
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CONFIG_FILE="$SCRIPT_DIR/omp-ai.conf"
+RUNTIME_CONFIG=""
+LEGACY_RUNTIME_CONFIG="/etc/omp-ai/runtime.conf"
 
 log(){ printf '\033[1;34m[omp-ai]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m[omp-ai]\033[0m %s\n' "$*"; }
@@ -170,6 +172,9 @@ while (($#)); do
 done
 
 HARDEN_HOME="$(bool01 "$HARDEN_HOME")"; ASSUME_YES="$(bool01 "$ASSUME_YES")"
+# Live runtime tuning belongs to the isolated AI home, not the host-wide /etc tree.
+# Compute this only after omp-ai.conf/CLI overrides have finalized AI_HOME.
+RUNTIME_CONFIG="$AI_HOME/config/runtime.conf"
 source /etc/os-release
 [[ "${ID:-}" == arch ]] || die "This installer targets Arch Linux."
 [[ "$MODEL_STORE" = /* && "$MODEL_STORE" != / ]] || die "MODEL_STORE must be an absolute non-root path"
@@ -320,6 +325,36 @@ log "Podman: rootless=$podman_rootless cgroups=$podman_cgroup_version manager=$p
 [[ "$podman_cgroup_manager" == systemd ]] || die "Podman cgroup manager is '${podman_cgroup_manager:-<missing>}', expected 'systemd'"
 
 root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/state" "$AI_HOME/state/.omp" "$AI_HOME/state/.omp/agent" "$AI_HOME/src" "$AI_HOME/build"
+root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/config"
+if [[ ! -e "$RUNTIME_CONFIG" && -f "$LEGACY_RUNTIME_CONFIG" ]]; then
+  log "Migrating live llama runtime config: $LEGACY_RUNTIME_CONFIG -> $RUNTIME_CONFIG"
+  root install -o root -g "$AI_GID" -m 0640 "$LEGACY_RUNTIME_CONFIG" "$RUNTIME_CONFIG"
+  root rm -f "$LEGACY_RUNTIME_CONFIG"
+  root rmdir /etc/omp-ai 2>/dev/null || true
+fi
+if [[ ! -e "$RUNTIME_CONFIG" ]]; then
+  log "Creating live llama runtime config: $RUNTIME_CONFIG"
+  root tee "$RUNTIME_CONFIG" >/dev/null <<EOT
+# Live llama.cpp runtime tuning.
+# Edit with: omp-ai config edit
+# Apply changes with: omp-ai stop && omp-ai
+LLAMA_CTX_TOTAL=$LLAMA_CTX_TOTAL
+LLAMA_PARALLEL=$LLAMA_PARALLEL
+VRAM_RESERVE_MIB=$VRAM_RESERVE_MIB
+LLAMA_CACHE_RAM_MIB=$LLAMA_CACHE_RAM_MIB
+MODELS_MAX=$MODELS_MAX
+LLAMA_MEM=$LLAMA_MEM
+EOT
+else
+  log "Preserving live llama runtime config: $RUNTIME_CONFIG"
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_CACHE_RAM_MIB MODELS_MAX LLAMA_MEM; do
+    if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
+      printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
+    fi
+  done
+fi
+root chown root:"$AI_GID" "$RUNTIME_CONFIG"
+root chmod 0640 "$RUNTIME_CONFIG"
 root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE"
 SECRET_ENV="$AI_HOME/secrets/omp.env"
 if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
@@ -421,13 +456,15 @@ container_exists(){
   case \$rc in 0) return 0;; 1) return 1;; *) echo "[omp-ai] ERROR: Podman control operation failed (rc=\$rc)." >&2; exit "\$rc";; esac
 }
 
-shopt -s nullglob
-markers=("\$SESS_DIR"/*.session)
-shopt -u nullglob
-(( \${#markers[@]} == 0 )) || {
-  echo "Active OMP sessions exist. Close them (or run: omp-ai stop) before updating." >&2
-  exit 3
-}
+if [[ "\$MODE" != rebuild-base ]]; then
+  shopt -s nullglob
+  markers=("\$SESS_DIR"/*.session)
+  shopt -u nullglob
+  (( \${#markers[@]} == 0 )) || {
+    echo "Active OMP sessions exist. Close them (or run: omp-ai stop) before updating the live workbench." >&2
+    exit 3
+  }
+fi
 
 if [[ "\$MODE" != rebuild-base ]] && container_exists "\$WORKBENCH"; then
   was_running="\$(pctl inspect -f '{{.State.Running}}' "\$WORKBENCH" 2>/dev/null || true)"
@@ -618,9 +655,40 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
+load_runtime_config(){
+  local line key value n=0
+  [[ -r "\$RUNTIME_CONFIG" ]] || return 0
+  while IFS= read -r line || [[ -n "\$line" ]]; do
+    ((++n))
+    line="\${line%$'\\r'}"
+    [[ "\$line" =~ ^[[:space:]]*$ || "\$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "\$line" =~ ^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*([^#[:space:]]+)[[:space:]]*(#.*)?$ ]]; then
+      key="\${BASH_REMATCH[1]}"; value="\${BASH_REMATCH[2]}"
+    else
+      echo "[omp-ai] ERROR: \$RUNTIME_CONFIG:\$n: expected KEY=VALUE" >&2
+      return 2
+    fi
+    case "\$key" in
+      LLAMA_CTX_TOTAL) LLAMA_CTX_TOTAL="\$value";;
+      LLAMA_PARALLEL) LLAMA_PARALLEL="\$value";;
+      VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="\$value";;
+      LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="\$value";;
+      MODELS_MAX) MODELS_MAX="\$value";;
+      LLAMA_MEM) LLAMA_MEM="\$value";;
+      *) echo "[omp-ai] ERROR: unsupported live runtime key: \$key" >&2; return 2;;
+    esac
+  done < "\$RUNTIME_CONFIG"
+  [[ "\$LLAMA_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LLAMA_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: LLAMA_CTX_TOTAL must be >= 1024" >&2; return 2; }
+  [[ "\$LLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( LLAMA_PARALLEL >= 1 )) || { echo "[omp-ai] ERROR: LLAMA_PARALLEL must be >= 1" >&2; return 2; }
+  [[ "\$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: VRAM_RESERVE_MIB must be an integer" >&2; return 2; }
+  [[ "\$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: LLAMA_CACHE_RAM_MIB must be an integer" >&2; return 2; }
+  [[ "\$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || { echo "[omp-ai] ERROR: MODELS_MAX must be >= 1" >&2; return 2; }
+  [[ -n "\$LLAMA_MEM" && "\$LLAMA_MEM" != *[[:space:]]* ]] || { echo "[omp-ai] ERROR: invalid LLAMA_MEM" >&2; return 2; }
+}
+load_runtime_config
 LLAMA_NAME=ompai-llama
 WORKBENCH=ompai-workbench
 SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"
@@ -706,6 +774,11 @@ kill_exec_session(){
   rm -f "\$meta"
 }
 case "\${1:-}" in
+  config)
+    echo "Runtime config: \$RUNTIME_CONFIG"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_CACHE_RAM_MIB=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_CACHE_RAM_MIB" "\$MODELS_MAX" "\$LLAMA_MEM"
+    exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
     # lifecycle lock or a wedged container runtime operation.
@@ -817,10 +890,18 @@ PUBLIC="/usr/local/bin/omp-ai"
 root tee "$PUBLIC" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"
+INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 case "\${1:-}" in
   stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
   status|logs) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
+  config)
+    shift
+    case "\${1:-show}" in
+      show|"") exec sudo -n -u "\$AI_USER" "\$INNER" config;;
+      path) printf '%s\n' "\$RUNTIME_CONFIG"; exit 0;;
+      edit) exec sudoedit "\$RUNTIME_CONFIG";;
+      *) echo "Usage: omp-ai config [show|path|edit]" >&2; exit 2;;
+    esac;;
   shell) sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$INNER" shell;;
   reset-env) exec sudo -n -u "\$AI_USER" "\$INNER" reset-env;;
   update) shift; (( \$# == 0 )) || { echo "Usage: omp-ai update" >&2; exit 2; }; sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
@@ -902,12 +983,23 @@ WantedBy=timers.target
 EOT
 root systemctl daemon-reload; root systemctl enable --now omp-ai-reaper.timer
 
-# Maintenance cleanup after rewriting helpers.
-mapfile -t old_agents < <(as_ai timeout --kill-after=3s 20s podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
-(( ${#old_agents[@]} )) && as_ai timeout --kill-after=3s 20s podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
-as_ai timeout --kill-after=3s 20s podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
-as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
-as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
+# Maintenance cleanup after rewriting helpers. Never interrupt a live OMP
+# session just because setup was re-run: active sessions keep using the
+# already-running workbench/router, and the new helpers/config take effect on
+# the next launch.
+shopt -s nullglob
+active_markers=("$AI_RUNTIME/omp-ai-sessions"/*.session)
+shopt -u nullglob
+if (( ${#active_markers[@]} )); then
+  warn "Active OMP session(s) detected; leaving the running workbench/router/session markers untouched."
+  warn "New helper code will apply after those sessions exit. Live llama tuning applies after: omp-ai stop && omp-ai"
+else
+  mapfile -t old_agents < <(as_ai timeout --kill-after=3s 20s podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
+  (( ${#old_agents[@]} )) && as_ai timeout --kill-after=3s 20s podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
+  as_ai timeout --kill-after=3s 20s podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
+  as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+  as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
+fi
 root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 
 ok "Setup complete"
@@ -915,7 +1007,8 @@ echo "Workspace:        $WORKSPACE"
 echo "Model store:      $MODEL_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
-echo "Context total:     $LLAMA_CTX_TOTAL"
+echo "Initial context:   $LLAMA_CTX_TOTAL"
+echo "Runtime config:    $RUNTIME_CONFIG"
 echo "Workbench base:   $WORKBENCH_BASE_IMAGE"
 echo
 echo "Next: ai-model add /path/model.gguf && omp-ai"
