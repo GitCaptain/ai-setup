@@ -458,8 +458,23 @@ browser:
   enabled: false
 computer:
   enabled: false
+modelRoleStorage: global
 modelRoles:
+  default: llama.cpp/$WORK_MODEL
+  smol: llama.cpp/$WORK_MODEL
+  slow: llama.cpp/$SPEC_TARGET_MODEL:xhigh
+  plan: llama.cpp/$SPEC_TARGET_MODEL:xhigh
+  commit: llama.cpp/$WORK_MODEL
+  tiny: llama.cpp/$WORK_MODEL
+  memory: llama.cpp/$WORK_MODEL
+  task: llama.cpp/$WORK_MODEL
+  advisor: llama.cpp/$SPEC_TARGET_MODEL:xhigh
   web: web/$WEB_SEARCH_PRIMARY
+cycleOrder:
+  - default
+  - slow
+advisor:
+  enabled: false
 retry:
   fallbackChains:
 EOT
@@ -651,6 +666,12 @@ root rmdir "$AI_HOME/src" 2>/dev/null || true
 log "Building/updating lightweight OMP runtime from the official prebuilt binary..."
 as_ai "$OMP_UPDATE_HELPER" rebuild-base
 
+# OMP user configuration under /state/.omp is persistent user state.
+# The installer seeds config.yml only on first install (when it does not exist).
+# On every rerun, modelRoles/cycleOrder/advisor/compaction and all other OMP
+# settings are left exactly as the user configured them.
+log "Preserving OMP user configuration and model roles..."
+
 as_ai podman pull "$LLAMA_IMAGE"
 
 # Rebuilding localhost/omp:latest does not mutate an already-created writable
@@ -755,7 +776,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; WEB_SEARCH_PRIMARY="$WEB_SEARCH_PRIMARY"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -1043,6 +1064,11 @@ esac
 
 workdir_rel=""; share_modes=(); share_sources=(); omp_args=()
 while (( \$# )); do case "\$1" in --workdir) workdir_rel="\${2:-}"; shift 2;; --share) share_modes+=(rw); share_sources+=("\${2:?}"); shift 2;; --share-ro) share_modes+=(ro); share_sources+=("\${2:?}"); shift 2;; --) shift; omp_args=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
+
+# Do not inject --model. Fresh/resumed sessions follow OMP's own persistent
+# configuration and the model saved in the session. User role/model changes
+# therefore survive installer reruns and launcher starts.
+
 candidate="\$(realpath -m "\$WORKSPACE/\$workdir_rel")"; case "\$candidate" in "\$WORKSPACE"|"\$WORKSPACE"/*) ;; *) exit 2;; esac; [[ -d "\$candidate" ]] || exit 2
 container_workdir=/workspace; [[ "\$candidate" != "\$WORKSPACE" ]] && container_workdir="/workspace/\${candidate#"\$WORKSPACE/"}"
 find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q . || { echo "No models. Use ai-model add ..." >&2; exit 3; }
@@ -1084,18 +1110,8 @@ cleanup(){
 trap cleanup EXIT INT TERM HUP
 parent=\$\$; ( while kill -0 "\$parent" 2>/dev/null; do touch "\$MARKER" 2>/dev/null || exit 0; sleep 20; done ) & HB_PID=\$!
 secret_args=(); [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
-# Context is model-specific. Let OMP derive its compaction threshold from each
-# model's contextWindow override instead of forcing one global token threshold.
-OMP_RUNTIME_OVERLAY="/state/runtime/omp-runtime.yml"
-pctl exec "\$WORKBENCH" /bin/bash -lc "cat > '\$OMP_RUNTIME_OVERLAY' <<'YAML'
-compaction:
-  enabled: true
-  midTurnEnabled: true
-  thresholdPercent: -1
-  thresholdTokens: -1
-YAML"
 echo "[omp-ai] Shared router ready; persistent workbench active; session \$SESSION_ID"
-echo "[omp-ai] OMP compaction threshold: per-model/default reserve policy"
+echo "[omp-ai] OMP config: persistent /state/.omp configuration (preserved)"
 
 # The shell writes its container PID into the host-backed /state
 # before exec()ing OMP, so the reaper can terminate only a stale OMP process
@@ -1108,7 +1124,7 @@ podman exec "\${exec_tty[@]}" --workdir "\$container_workdir" "\${secret_args[@]
     set -e
     mkdir -p /state/runtime/omp-exec
     printf "%s\n" "\$\$" > "/state/runtime/omp-exec/\$OMP_SESSION_ID.pid"
-    exec /usr/local/bin/omp --config /state/runtime/omp-runtime.yml "\$@"
+    exec /usr/local/bin/omp "\$@"
   ' bash "\${omp_args[@]}"
 EOT
 root chmod 0755 "$INNER"
