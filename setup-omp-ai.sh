@@ -14,21 +14,32 @@ DRAFT_STORE=""  # empty => $AI_HOME/drafts
 
 LLAMA_IMAGE="ghcr.io/ggml-org/llama.cpp:server-cuda"
 MODELS_MAX=1
-LLAMA_CTX_TOTAL=65536
-LLAMA_PARALLEL=2
+LLAMA_CTX_TOTAL=32768
+LLAMA_PARALLEL=1
 LLAMA_MEM="22g"
 LLAMA_PORT=18080
-VRAM_RESERVE_MIB=512
+VRAM_RESERVE_MIB=256
 LLAMA_LOG_VERBOSITY=4
 LLAMA_CACHE_RAM_MIB=0
-LLAMA_CACHE_TYPE_K="q8_0"
-LLAMA_CACHE_TYPE_V="q8_0"
+LLAMA_CACHE_TYPE_K="f16"
+LLAMA_CACHE_TYPE_V="f16"
+
+# Per-model router profiles. The fast 9B keeps the benchmarked 64K/q8 KV, while
+# the slow 27B uses 32K/f16 + MTP. LLAMA_CTX_TOTAL / LLAMA_CACHE_TYPE_* above
+# are only the fallback profile for other discovered models.
+WORK_MODEL="Qwen3.5-9B-Q4_K_M"
+WORK_CTX_TOTAL=65536
+WORK_CACHE_TYPE_K="q8_0"
+WORK_CACHE_TYPE_V="q8_0"
 
 # Speculative decoding. Applied only to SPEC_TARGET_MODEL via llama router preset.
 SPEC_MODE="mtp"                 # none|mtp|dflash|ngram-mod
 SPEC_TARGET_MODEL="Qwen3.8-27B-Q4_K_M"
+SPEC_CTX_TOTAL=32768
+SPEC_CACHE_TYPE_K="f16"
+SPEC_CACHE_TYPE_V="f16"
 SPEC_DRAFT_FILE="mtp-Qwen3.8-27B-Q4_0.gguf"
-SPEC_DRAFT_N_MAX=4
+SPEC_DRAFT_N_MAX=8
 SPEC_DRAFT_P_MIN="0.8"
 SPEC_DRAFT_NGL="all"
 SPEC_DRAFT_CACHE_TYPE="q4_0"
@@ -131,6 +142,8 @@ set_cfg(){
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";; LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
     LLAMA_CACHE_TYPE_K) LLAMA_CACHE_TYPE_K="$v";; LLAMA_CACHE_TYPE_V) LLAMA_CACHE_TYPE_V="$v";;
+    WORK_MODEL) WORK_MODEL="$v";; WORK_CTX_TOTAL) WORK_CTX_TOTAL="$v";; WORK_CACHE_TYPE_K) WORK_CACHE_TYPE_K="$v";; WORK_CACHE_TYPE_V) WORK_CACHE_TYPE_V="$v";;
+    SPEC_CTX_TOTAL) SPEC_CTX_TOTAL="$v";; SPEC_CACHE_TYPE_K) SPEC_CACHE_TYPE_K="$v";; SPEC_CACHE_TYPE_V) SPEC_CACHE_TYPE_V="$v";;
     SPEC_MODE) SPEC_MODE="${v,,}";; SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="$v";; SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="$v";;
     SPEC_DRAFT_N_MAX) SPEC_DRAFT_N_MAX="$v";; SPEC_DRAFT_P_MIN) SPEC_DRAFT_P_MIN="$v";; SPEC_DRAFT_NGL) SPEC_DRAFT_NGL="$v";; SPEC_DRAFT_CACHE_TYPE) SPEC_DRAFT_CACHE_TYPE="$v";;
     OMP_VERSION) OMP_VERSION="$v";;
@@ -208,6 +221,13 @@ case "$DRAFT_STORE" in "$MAIN_HOME"|"$MAIN_HOME"/*) die "DRAFT_STORE must be out
 [[ "$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || die "LLAMA_CACHE_RAM_MIB must be >= 0"
 case "$LLAMA_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid LLAMA_CACHE_TYPE_K";; esac
 case "$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid LLAMA_CACHE_TYPE_V";; esac
+[[ -n "$WORK_MODEL" && "$WORK_MODEL" != *']'* && "$WORK_MODEL" != *$'\n'* ]] || die "Invalid WORK_MODEL"
+[[ "$WORK_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( WORK_CTX_TOTAL >= 1024 )) || die "WORK_CTX_TOTAL must be >= 1024"
+case "$WORK_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid WORK_CACHE_TYPE_K";; esac
+case "$WORK_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid WORK_CACHE_TYPE_V";; esac
+[[ "$SPEC_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( SPEC_CTX_TOTAL >= 1024 )) || die "SPEC_CTX_TOTAL must be >= 1024"
+case "$SPEC_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid SPEC_CACHE_TYPE_K";; esac
+case "$SPEC_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid SPEC_CACHE_TYPE_V";; esac
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "VRAM_RESERVE_MIB must be an integer"
 [[ "$LLAMA_LOG_VERBOSITY" =~ ^[0-5]$ ]] || die "LLAMA_LOG_VERBOSITY must be 0..5"
 case "$SPEC_MODE" in none|mtp|dflash|ngram-mod) ;; *) die "SPEC_MODE must be none/mtp/dflash/ngram-mod";; esac
@@ -380,8 +400,15 @@ LLAMA_LOG_VERBOSITY=$LLAMA_LOG_VERBOSITY
 LLAMA_CACHE_RAM_MIB=$LLAMA_CACHE_RAM_MIB
 LLAMA_CACHE_TYPE_K=$LLAMA_CACHE_TYPE_K
 LLAMA_CACHE_TYPE_V=$LLAMA_CACHE_TYPE_V
+WORK_MODEL=$WORK_MODEL
+WORK_CTX_TOTAL=$WORK_CTX_TOTAL
+WORK_CACHE_TYPE_K=$WORK_CACHE_TYPE_K
+WORK_CACHE_TYPE_V=$WORK_CACHE_TYPE_V
 SPEC_MODE=$SPEC_MODE
 SPEC_TARGET_MODEL=$SPEC_TARGET_MODEL
+SPEC_CTX_TOTAL=$SPEC_CTX_TOTAL
+SPEC_CACHE_TYPE_K=$SPEC_CACHE_TYPE_K
+SPEC_CACHE_TYPE_V=$SPEC_CACHE_TYPE_V
 SPEC_DRAFT_FILE=$SPEC_DRAFT_FILE
 SPEC_DRAFT_N_MAX=$SPEC_DRAFT_N_MAX
 SPEC_DRAFT_P_MIN=$SPEC_DRAFT_P_MIN
@@ -392,7 +419,7 @@ LLAMA_MEM=$LLAMA_MEM
 EOT
 else
   log "Preserving live llama runtime config: $RUNTIME_CONFIG"
-  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V SPEC_MODE SPEC_TARGET_MODEL SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V WORK_MODEL WORK_CTX_TOTAL WORK_CACHE_TYPE_K WORK_CACHE_TYPE_V SPEC_MODE SPEC_TARGET_MODEL SPEC_CTX_TOTAL SPEC_CACHE_TYPE_K SPEC_CACHE_TYPE_V SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
     if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
       printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
     fi
@@ -728,7 +755,7 @@ INNER="/usr/local/libexec/omp-ai-inner"
 root tee "$INNER" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -752,6 +779,13 @@ load_runtime_config(){
       LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="\$value";;
       LLAMA_CACHE_TYPE_K) LLAMA_CACHE_TYPE_K="\$value";;
       LLAMA_CACHE_TYPE_V) LLAMA_CACHE_TYPE_V="\$value";;
+      WORK_MODEL) WORK_MODEL="\$value";;
+      WORK_CTX_TOTAL) WORK_CTX_TOTAL="\$value";;
+      WORK_CACHE_TYPE_K) WORK_CACHE_TYPE_K="\$value";;
+      WORK_CACHE_TYPE_V) WORK_CACHE_TYPE_V="\$value";;
+      SPEC_CTX_TOTAL) SPEC_CTX_TOTAL="\$value";;
+      SPEC_CACHE_TYPE_K) SPEC_CACHE_TYPE_K="\$value";;
+      SPEC_CACHE_TYPE_V) SPEC_CACHE_TYPE_V="\$value";;
       SPEC_MODE) SPEC_MODE="\${value,,}";;
       SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="\$value";;
       SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="\$value";;
@@ -778,6 +812,13 @@ load_runtime_config(){
   [[ "\$LLAMA_CACHE_RAM_MIB" =~ ^[0-9]+$ ]] || { echo "[omp-ai] ERROR: LLAMA_CACHE_RAM_MIB must be an integer" >&2; return 2; }
   case "\$LLAMA_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid LLAMA_CACHE_TYPE_K" >&2; return 2;; esac
   case "\$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid LLAMA_CACHE_TYPE_V" >&2; return 2;; esac
+  [[ -n "\$WORK_MODEL" && "\$WORK_MODEL" != *']'* && "\$WORK_MODEL" != *$'\\n'* ]] || { echo "[omp-ai] ERROR: invalid WORK_MODEL" >&2; return 2; }
+  [[ "\$WORK_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( WORK_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: WORK_CTX_TOTAL must be >= 1024" >&2; return 2; }
+  case "\$WORK_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid WORK_CACHE_TYPE_K" >&2; return 2;; esac
+  case "\$WORK_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid WORK_CACHE_TYPE_V" >&2; return 2;; esac
+  [[ "\$SPEC_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( SPEC_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: SPEC_CTX_TOTAL must be >= 1024" >&2; return 2; }
+  case "\$SPEC_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid SPEC_CACHE_TYPE_K" >&2; return 2;; esac
+  case "\$SPEC_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid SPEC_CACHE_TYPE_V" >&2; return 2;; esac
   [[ "\$MODELS_MAX" =~ ^[0-9]+$ ]] && (( MODELS_MAX >= 1 )) || { echo "[omp-ai] ERROR: MODELS_MAX must be >= 1" >&2; return 2; }
   [[ -n "\$LLAMA_MEM" && "\$LLAMA_MEM" != *[[:space:]]* ]] || { echo "[omp-ai] ERROR: invalid LLAMA_MEM" >&2; return 2; }
 }
@@ -838,16 +879,40 @@ stop_if_unused(){
 }
 make_models_preset(){
   local preset="\$XDG_RUNTIME_DIR/omp-ai-models.ini" draft type
-  # Assign before any early return (e.g. missing optional draft model),
-  # otherwise set -u would make start_router fail on LLAMA_MODELS_PRESET.
   LLAMA_MODELS_PRESET="\$preset"
-  printf 'version = 1\\n' >"\$preset"
+  cat >"\$preset" <<EOP
+version = 1
+
+[*]
+ctx-size = \$LLAMA_CTX_TOTAL
+cache-type-k = \$LLAMA_CACHE_TYPE_K
+cache-type-v = \$LLAMA_CACHE_TYPE_V
+EOP
+
+  # Fast/default workhorse profile. Keep it separate from the slow speculative target.
+  if [[ "\$WORK_MODEL" != "\$SPEC_TARGET_MODEL" ]]; then
+    cat >>"\$preset" <<EOP
+
+[\$WORK_MODEL]
+ctx-size = \$WORK_CTX_TOTAL
+cache-type-k = \$WORK_CACHE_TYPE_K
+cache-type-v = \$WORK_CACHE_TYPE_V
+EOP
+  fi
+
+  # The slow target always gets its own context/KV profile, even when speculation is disabled.
+  cat >>"\$preset" <<EOP
+
+[\$SPEC_TARGET_MODEL]
+ctx-size = \$SPEC_CTX_TOTAL
+cache-type-k = \$SPEC_CACHE_TYPE_K
+cache-type-v = \$SPEC_CACHE_TYPE_V
+EOP
+
   case "\$SPEC_MODE" in
     none) ;;
     ngram-mod)
       cat >>"\$preset" <<EOP
-
-[\$SPEC_TARGET_MODEL]
 spec-type = ngram-mod
 EOP
       ;;
@@ -856,13 +921,12 @@ EOP
       [[ -r "\$draft" ]] || {
         echo "[omp-ai] WARNING: speculative draft not found: \$draft; starting without speculative decoding." >&2
         echo "[omp-ai] Download it, then restart with: omp-ai stop && omp-ai -c" >&2
+        chmod 0600 "\$preset"
         return 0
       }
       [[ "\$(head -c4 "\$draft" 2>/dev/null || true)" == GGUF ]] || { echo "[omp-ai] ERROR: invalid draft GGUF: \$draft" >&2; return 4; }
       [[ "\$SPEC_MODE" == mtp ]] && type=draft-mtp || type=draft-dflash
       cat >>"\$preset" <<EOP
-
-[\$SPEC_TARGET_MODEL]
 spec-type = \$type
 spec-draft-model = /drafts/\$SPEC_DRAFT_FILE
 spec-draft-ngl = \$SPEC_DRAFT_NGL
@@ -879,16 +943,14 @@ start_router(){
   if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
   pctl rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   make_models_preset || return \$?
-  echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL, ctx-total=\$LLAMA_CTX_TOTAL, spec=\$SPEC_MODE"
+  echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL; work=\$WORK_MODEL/\$WORK_CTX_TOTAL/\$WORK_CACHE_TYPE_K; slow=\$SPEC_TARGET_MODEL/\$SPEC_CTX_TOTAL/\$SPEC_CACHE_TYPE_K+\$SPEC_MODE"
   pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" --mount "type=bind,src=\$DRAFT_STORE,dst=/drafts,ro=true,bind-nonrecursive" --mount "type=bind,src=\$LLAMA_MODELS_PRESET,dst=/config/models.ini,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
     --models-dir /models --models-preset /config/models.ini --models-max "\$MODELS_MAX" --models-autoload \
     --host 0.0.0.0 --port 8080 --metrics \
     --parallel "\$LLAMA_PARALLEL" \
     --cont-batching \
     --kv-unified \
-    --ctx-size "\$LLAMA_CTX_TOTAL" \
     --cache-ram "\$LLAMA_CACHE_RAM_MIB" --no-cache-idle-slots \
-    --cache-type-k "\$LLAMA_CACHE_TYPE_K" --cache-type-v "\$LLAMA_CACHE_TYPE_V" \
     --flash-attn auto --fit on --fit-target "\$VRAM_RESERVE_MIB" \
     --offline >/dev/null
   for _ in \$(seq 1 300); do healthy && return 0; [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] || break; sleep 1; done
@@ -909,8 +971,8 @@ kill_exec_session(){
 case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
-    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
-      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$LLAMA_CACHE_TYPE_K" "\$LLAMA_CACHE_TYPE_V" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nWORK_MODEL=%s\nWORK_CTX_TOTAL=%s\nWORK_CACHE_TYPE_K=%s\nWORK_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_CTX_TOTAL=%s\nSPEC_CACHE_TYPE_K=%s\nSPEC_CACHE_TYPE_V=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$LLAMA_CACHE_TYPE_K" "\$LLAMA_CACHE_TYPE_V" "\$WORK_MODEL" "\$WORK_CTX_TOTAL" "\$WORK_CACHE_TYPE_K" "\$WORK_CACHE_TYPE_V" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_CTX_TOTAL" "\$SPEC_CACHE_TYPE_K" "\$SPEC_CACHE_TYPE_V" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
     exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
@@ -1022,21 +1084,18 @@ cleanup(){
 trap cleanup EXIT INT TERM HUP
 parent=\$\$; ( while kill -0 "\$parent" 2>/dev/null; do touch "\$MARKER" 2>/dev/null || exit 0; sleep 20; done ) & HB_PID=\$!
 secret_args=(); [[ -r "\$SECRET_ENV" ]] && secret_args+=(--env-file "\$SECRET_ENV")
-# Keep OMP compaction below this llama.cpp instance's real --ctx-size.  Runtime
-# discovery may otherwise advertise the model architecture's larger context.
-reserve=\$(( LLAMA_CTX_TOTAL * 15 / 100 ))
-(( reserve < 16384 )) && reserve=16384
-compact_at=\$(( LLAMA_CTX_TOTAL - reserve ))
-(( compact_at < 4096 )) && compact_at=4096
+# Context is model-specific. Let OMP derive its compaction threshold from each
+# model's contextWindow override instead of forcing one global token threshold.
 OMP_RUNTIME_OVERLAY="/state/runtime/omp-runtime.yml"
 pctl exec "\$WORKBENCH" /bin/bash -lc "cat > '\$OMP_RUNTIME_OVERLAY' <<'YAML'
 compaction:
   enabled: true
   midTurnEnabled: true
-  thresholdTokens: \$compact_at
+  thresholdPercent: -1
+  thresholdTokens: -1
 YAML"
 echo "[omp-ai] Shared router ready; persistent workbench active; session \$SESSION_ID"
-echo "[omp-ai] OMP compaction threshold: \$compact_at tokens (llama ctx-total=\$LLAMA_CTX_TOTAL)"
+echo "[omp-ai] OMP compaction threshold: per-model/default reserve policy"
 
 # The shell writes its container PID into the host-backed /state
 # before exec()ing OMP, so the reaper can terminate only a stale OMP process
@@ -1179,7 +1238,9 @@ echo "Model store:      $MODEL_STORE"
 echo "Draft store:      $DRAFT_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
-echo "Initial context:   $LLAMA_CTX_TOTAL"
+echo "Fallback context:  $LLAMA_CTX_TOTAL"
+echo "Work profile:      $WORK_MODEL ${WORK_CTX_TOTAL} ctx ${WORK_CACHE_TYPE_K}/${WORK_CACHE_TYPE_V}"
+echo "Slow profile:      $SPEC_TARGET_MODEL ${SPEC_CTX_TOTAL} ctx ${SPEC_CACHE_TYPE_K}/${SPEC_CACHE_TYPE_V}"
 echo "Llama verbosity:   $LLAMA_LOG_VERBOSITY"
 echo "Speculative:      $SPEC_MODE ($SPEC_TARGET_MODEL)"
 echo "Runtime config:    $RUNTIME_CONFIG"
