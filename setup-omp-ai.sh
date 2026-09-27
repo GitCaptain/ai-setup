@@ -49,9 +49,9 @@ SPEC_DRAFT_CACHE_TYPE="q4_0"
 OMP_VERSION=""
 # Apt/glibc-based persistent workbench. Debian 13 is the current stable default.
 WORKBENCH_BASE_IMAGE="debian:13-slim"
-OMP_MEM="3g"
+OMP_MEM="6g"
 
-AI_SLICE_MEM="25G"
+AI_SLICE_MEM="26G"
 AI_SLICE_CPU="2400%"
 
 EXA_API_KEY=""
@@ -677,7 +677,43 @@ as_ai podman pull "$LLAMA_IMAGE"
 # Rebuilding localhost/omp:latest does not mutate an already-created writable
 # workbench rootfs. Preserve it rather than silently deleting user-installed
 # packages; tell the user how to migrate explicitly.
+#
+# Podman 6.x can report success for `podman update --memory` on a stopped
+# rootless container while leaving the stored HostConfig.Memory unchanged.
+# Start the lightweight sleep container temporarily, update the live cgroup +
+# stored config, verify the value, then restore its previous stopped state.
 if as_ai timeout --kill-after=3s 20s podman container exists ompai-workbench 2>/dev/null; then
+  log "Applying persistent workbench memory limit: $OMP_MEM"
+  wb_was_running="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.State.Running}}' ompai-workbench 2>/dev/null || echo false)"
+  if [[ "$wb_was_running" != true ]]; then
+    as_ai timeout --kill-after=3s 20s podman start ompai-workbench >/dev/null || die "Failed to start ompai-workbench for resource-limit update"
+  fi
+
+  if ! as_ai timeout --kill-after=3s 20s podman update --memory="$OMP_MEM" ompai-workbench >/dev/null; then
+    [[ "$wb_was_running" == true ]] || as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+    die "Failed to update ompai-workbench memory limit to $OMP_MEM"
+  fi
+
+  # Convert the configured IEC size to bytes for an exact post-update check.
+  expected_wb_mem="$(python - "$OMP_MEM" <<'PYMEM'
+import re, sys
+s=sys.argv[1].strip().lower()
+m=re.fullmatch(r'([0-9]+)([kmgt]?)(?:i?b)?', s)
+if not m:
+    raise SystemExit(f"invalid memory size: {sys.argv[1]}")
+n=int(m.group(1)); u=m.group(2)
+print(n * (1024 ** ({'':0,'k':1,'m':2,'g':3,'t':4}[u])))
+PYMEM
+)"
+  actual_wb_mem="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.HostConfig.Memory}}' ompai-workbench 2>/dev/null || echo 0)"
+
+  if [[ "$wb_was_running" != true ]]; then
+    as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+  fi
+
+  [[ "$actual_wb_mem" == "$expected_wb_mem" ]] || die "Podman did not persist ompai-workbench memory limit: wanted $OMP_MEM ($expected_wb_mem bytes), inspect reports $actual_wb_mem bytes"
+  ok "Persistent workbench memory limit verified: $OMP_MEM ($actual_wb_mem bytes)"
+
   current_base="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{ index .Config.Labels "io.ompai.workbench-base" }}' ompai-workbench 2>/dev/null || true)"
   if [[ "$current_base" != "$WORKBENCH_BASE_IMAGE" ]]; then
     warn "Existing ompai-workbench was created from '${current_base:-legacy/unknown}'. New base image is '$WORKBENCH_BASE_IMAGE'."
@@ -886,6 +922,10 @@ ensure_workbench(){
       --mount "type=bind,src=\$SHARE_STAGE,dst=\$SHARE_STAGE,rw=true,bind-propagation=rslave" \
       localhost/omp:latest >/dev/null
   fi
+  # Apply the current workbench memory limit to existing containers too.
+  # The memory limit supplied at container creation only affects first creation; without this, rerunning
+  # setup with a larger OMP_MEM would leave the persistent workbench at the old cap.
+  pctl update --memory "\$OMP_MEM" "\$WORKBENCH" >/dev/null
   if ! workbench_running; then
     pctl start "\$WORKBENCH" >/dev/null
     # A stopped workbench may contain aliases/meta from a previous crashed boot.
@@ -1254,6 +1294,7 @@ echo "Model store:      $MODEL_STORE"
 echo "Draft store:      $DRAFT_STORE"
 echo "Model instances:  $MODELS_MAX"
 echo "Parallel slots:   $LLAMA_PARALLEL"
+echo "Workbench memory: $OMP_MEM"
 echo "Fallback context:  $LLAMA_CTX_TOTAL"
 echo "Work profile:      $WORK_MODEL ${WORK_CTX_TOTAL} ctx ${WORK_CACHE_TYPE_K}/${WORK_CACHE_TYPE_V}"
 echo "Slow profile:      $SPEC_TARGET_MODEL ${SPEC_CTX_TOTAL} ctx ${SPEC_CACHE_TYPE_K}/${SPEC_CACHE_TYPE_V}"
