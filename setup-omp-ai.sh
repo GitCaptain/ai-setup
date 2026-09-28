@@ -743,8 +743,11 @@ if ! flock -w 10 9; then
   exit 6
 fi
 prepare_stage(){
+  # /run is tmpfs and is recreated on every boot. Recreate STAGE on demand
+  # before turning it into a shared bind mount.
+  install -d -o root -g root -m 0711 "\$STAGE"
   # Direct shares are bind-mounted below STAGE after the persistent workbench
-  # may already be running.  Make STAGE a shared mount point so rslave
+  # may already be running. Make STAGE a shared mount point so rslave
   # propagation carries new host submounts into the workbench namespace.
   if ! mountpoint -q "\$STAGE"; then
     mount --bind "\$STAGE" "\$STAGE"
