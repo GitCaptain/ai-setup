@@ -380,6 +380,10 @@ log "Podman: rootless=$podman_rootless cgroups=$podman_cgroup_version manager=$p
 [[ "$podman_cgroup_manager" == systemd ]] || die "Podman cgroup manager is '${podman_cgroup_manager:-<missing>}', expected 'systemd'"
 
 root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/state" "$AI_HOME/state/.omp" "$AI_HOME/state/.omp/agent" "$AI_HOME/src" "$AI_HOME/build"
+# Keep a host-side last-known-good copy of the OMP settings outside /state and
+# outside the workbench mount.  OMP itself cannot touch this directory from the
+# container; the host launcher refreshes it after successful sessions.
+root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/backup"
 root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/config"
 if [[ ! -e "$RUNTIME_CONFIG" && -f "$LEGACY_RUNTIME_CONFIG" ]]; then
   log "Migrating live llama runtime config: $LEGACY_RUNTIME_CONFIG -> $RUNTIME_CONFIG"
@@ -445,9 +449,27 @@ SECRET_ENV="$AI_HOME/secrets/omp.env"
 if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
 
 OMP_NATIVE_CONFIG="$AI_HOME/state/.omp/agent/config.yml"
-if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$AI_HOME/state/.omp/agent/config.yaml" ]]; then
+OMP_COMPAT_CONFIG="$AI_HOME/state/.omp/agent/config.yaml"
+OMP_CONFIG_BACKUP="$AI_HOME/backup/omp-config.last-good.yml"
+
+# Never turn a missing live config into a fresh default if we have a known-good
+# copy from a previous run.  This protects user roles/settings from OMP startup
+# regressions or accidental loss of the mounted config file.
+if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$OMP_COMPAT_CONFIG" && -s "$OMP_CONFIG_BACKUP" ]]; then
+  log "Restoring missing OMP config from last-known-good backup..."
+  root install -o "$AI_USER" -g "$AI_GID" -m 0600 "$OMP_CONFIG_BACKUP" "$OMP_NATIVE_CONFIG"
+fi
+
+if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$OMP_COMPAT_CONFIG" ]]; then
+  # A non-empty agent directory with no main config is a recovery situation,
+  # not a fresh install.  Refuse to seed defaults because doing so could hide
+  # an OMP-quarantined/migration-lost user configuration.
+  if root find "$AI_HOME/state/.omp/agent" -mindepth 1 -maxdepth 1 -type f -print -quit | grep -q .; then
+    die "OMP config is missing but existing OMP state is present under $AI_HOME/state/.omp/agent; refusing to create defaults. Recover config.yml/config.yaml first."
+  fi
   log "Creating initial OMP native config: $OMP_NATIVE_CONFIG"
   root tee "$OMP_NATIVE_CONFIG" >/dev/null <<EOT
+setupVersion: 1
 tools:
   approvalMode: yolo
 web_search:
@@ -489,6 +511,28 @@ EOT
 else
   log "Preserving OMP native config under $AI_HOME/state/.omp/agent/"
 fi
+
+# OMP uses setupVersion as the persistent first-run/onboarding marker.
+# Preserve all user settings, but add the marker if an older installer-created
+# config predates this key; otherwise OMP can reopen its onboarding wizard on
+# an ordinary `omp-ai` launch. Never overwrite an explicit setupVersion.
+OMP_ACTIVE_CONFIG="$OMP_NATIVE_CONFIG"
+if [[ ! -e "$OMP_ACTIVE_CONFIG" && -e "$AI_HOME/state/.omp/agent/config.yaml" ]]; then
+  OMP_ACTIVE_CONFIG="$AI_HOME/state/.omp/agent/config.yaml"
+fi
+if [[ -e "$OMP_ACTIVE_CONFIG" ]] && ! grep -Eq '^[[:space:]]*setupVersion[[:space:]]*:' "$OMP_ACTIVE_CONFIG"; then
+  log "Adding missing OMP onboarding marker (setupVersion: 1) without changing user settings..."
+  printf '\nsetupVersion: 1\n' | root tee -a "$OMP_ACTIVE_CONFIG" >/dev/null
+fi
+# Snapshot the exact live user config after the conservative setup handling
+# above.  Future setup reruns and launcher starts can restore it byte-for-byte.
+OMP_LIVE_CONFIG=""
+if [[ -e "$OMP_NATIVE_CONFIG" ]]; then OMP_LIVE_CONFIG="$OMP_NATIVE_CONFIG";
+elif [[ -e "$OMP_COMPAT_CONFIG" ]]; then OMP_LIVE_CONFIG="$OMP_COMPAT_CONFIG"; fi
+if [[ -n "$OMP_LIVE_CONFIG" ]]; then
+  root install -o "$AI_USER" -g "$AI_GID" -m 0600 "$OMP_LIVE_CONFIG" "$OMP_CONFIG_BACKUP"
+fi
+
 root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
 root chmod -R go-rwx "$AI_HOME/state"
 # Access invariant for agent-visible state: MAIN_USER >= ompai.
@@ -888,7 +932,35 @@ WORKBENCH=ompai-workbench
 SESS_DIR="\$XDG_RUNTIME_DIR/omp-ai-sessions"
 EXEC_DIR="\$AI_HOME/state/runtime/omp-exec"
 ROUTER_LOCK="\$XDG_RUNTIME_DIR/omp-ai-router.lock"
-mkdir -p "\$SESS_DIR" "\$EXEC_DIR"; chmod 0700 "\$SESS_DIR" "\$EXEC_DIR"
+OMP_CONFIG_DIR="\$AI_HOME/state/.omp/agent"
+OMP_CONFIG_BACKUP="\$AI_HOME/backup/omp-config.last-good.yml"
+mkdir -p "\$SESS_DIR" "\$EXEC_DIR" "\$OMP_CONFIG_DIR" "\$AI_HOME/backup"; chmod 0700 "\$SESS_DIR" "\$EXEC_DIR" "\$OMP_CONFIG_DIR" "\$AI_HOME/backup"
+
+find_live_omp_config(){
+  if [[ -f "\$OMP_CONFIG_DIR/config.yml" ]]; then printf '%s\n' "\$OMP_CONFIG_DIR/config.yml"; return 0; fi
+  if [[ -f "\$OMP_CONFIG_DIR/config.yaml" ]]; then printf '%s\n' "\$OMP_CONFIG_DIR/config.yaml"; return 0; fi
+  return 1
+}
+snapshot_omp_config(){
+  local live tmp
+  live="\$(find_live_omp_config 2>/dev/null || true)"
+  [[ -n "\$live" && -s "\$live" ]] || return 0
+  tmp="\$OMP_CONFIG_BACKUP.tmp.\$\$"
+  install -m 0600 "\$live" "\$tmp"
+  mv -f "\$tmp" "\$OMP_CONFIG_BACKUP"
+}
+restore_omp_config_if_missing(){
+  local live
+  live="\$(find_live_omp_config 2>/dev/null || true)"
+  if [[ -n "\$live" ]]; then
+    snapshot_omp_config
+    return 0
+  fi
+  if [[ -s "\$OMP_CONFIG_BACKUP" ]]; then
+    echo "[omp-ai] WARNING: OMP config disappeared; restoring last-known-good copy." >&2
+    install -m 0600 "\$OMP_CONFIG_BACKUP" "\$OMP_CONFIG_DIR/config.yml"
+  fi
+}
 pctl(){ timeout --kill-after=3s 20s podman "\$@"; }
 container_exists(){
   local rc=0
@@ -1084,7 +1156,7 @@ case "\${1:-}" in
   logs) shift; exec podman logs -f "\$LLAMA_NAME";;
   shell)
     ensure_workbench
-    set +e; podman exec -it -e HOME=/state --workdir /workspace "\$WORKBENCH" /bin/bash; rc=\$?; set -e
+    set +e; podman exec -it -e HOME=/state -e PI_CODING_AGENT_DIR=/state/.omp/agent -e OMP_PROFILE= --workdir /workspace "\$WORKBENCH" /bin/bash; rc=\$?; set -e
     has_sessions || pctl stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
     exit "\$rc";;
   reset-env)
@@ -1161,14 +1233,23 @@ echo "[omp-ai] OMP config: persistent /state/.omp configuration (preserved)"
 # without disturbing other live windows in the shared workbench.
 exec_tty=()
 if [[ -t 0 && -t 1 ]]; then exec_tty=(-it); fi
+restore_omp_config_if_missing
+set +e
 podman exec "\${exec_tty[@]}" --workdir "\$container_workdir" "\${secret_args[@]}" \
-  -e HOME=/state -e "TERM=\${TERM:-xterm}" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
+  -e HOME=/state -e PI_CODING_AGENT_DIR=/state/.omp/agent -e OMP_PROFILE= \
+  -e "TERM=\${TERM:-xterm}" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
   "\$WORKBENCH" /bin/bash -lc '
     set -e
     mkdir -p /state/runtime/omp-exec
     printf "%s\n" "\$\$" > "/state/runtime/omp-exec/\$OMP_SESSION_ID.pid"
     exec /usr/local/bin/omp "\$@"
   ' bash "\${omp_args[@]}"
+rc=\$?
+set -e
+# If OMP persisted legitimate user changes, make them the new last-known-good
+# copy.  If it removed the file, keep the previous backup untouched.
+snapshot_omp_config
+exit "\$rc"
 EOT
 root chmod 0755 "$INNER"
 root bash -n "$INNER"
