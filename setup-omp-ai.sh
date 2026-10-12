@@ -59,6 +59,7 @@ WEB_SEARCH_PRIMARY="auto"
 WEB_SEARCH_FALLBACK="duckduckgo"
 HARDEN_HOME="true"
 ASSUME_YES="false"
+STATE_CHECK_ONLY=0
 INITIAL_MODELS=()
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -98,6 +99,7 @@ Overrides:
   --exa-api-key KEY
   --web-search auto|exa|duckduckgo
   -y, --yes
+  --state-check                  read-only existing OMP state check; do not install
   -h, --help
 TXT
 }
@@ -122,6 +124,9 @@ MAIN_HOME="$(getent passwd "$MAIN_USER" | cut -d: -f6)"
 [[ -d "$MAIN_HOME" ]] || die "Cannot determine home for $MAIN_USER"
 
 root(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+# Private AI_HOME paths cannot be probed with the desktop user's [[ -e ]].
+# EACCES looks exactly like ENOENT with -e/-f/-s. Always use root checks.
+root_exists(){ root test -e "$1" || root test -L "$1"; }
 as_main(){
   if [[ $EUID -ne 0 && "$(id -un)" == "$MAIN_USER" ]]; then "$@";
   else root runuser -u "$MAIN_USER" -- env HOME="$MAIN_HOME" USER="$MAIN_USER" LOGNAME="$MAIN_USER" "$@"; fi
@@ -142,6 +147,7 @@ set_cfg(){
     LLAMA_PARALLEL) LLAMA_PARALLEL="$v";; LLAMA_MEM) LLAMA_MEM="$v";; VRAM_RESERVE_MIB) VRAM_RESERVE_MIB="$v";; LLAMA_LOG_VERBOSITY) LLAMA_LOG_VERBOSITY="$v";;
     LLAMA_CACHE_RAM_MIB) LLAMA_CACHE_RAM_MIB="$v";;
     LLAMA_CACHE_TYPE_K) LLAMA_CACHE_TYPE_K="$v";; LLAMA_CACHE_TYPE_V) LLAMA_CACHE_TYPE_V="$v";;
+    LLAMA_CDI_NO_LDCACHE) warn "Ignoring obsolete LLAMA_CDI_NO_LDCACHE from omp-ai.conf; standard NVIDIA CDI is restored.";;
     WORK_MODEL) WORK_MODEL="$v";; WORK_CTX_TOTAL) WORK_CTX_TOTAL="$v";; WORK_CACHE_TYPE_K) WORK_CACHE_TYPE_K="$v";; WORK_CACHE_TYPE_V) WORK_CACHE_TYPE_V="$v";;
     SPEC_CTX_TOTAL) SPEC_CTX_TOTAL="$v";; SPEC_CACHE_TYPE_K) SPEC_CACHE_TYPE_K="$v";; SPEC_CACHE_TYPE_V) SPEC_CACHE_TYPE_V="$v";;
     SPEC_MODE) SPEC_MODE="${v,,}";; SPEC_TARGET_MODEL) SPEC_TARGET_MODEL="$v";; SPEC_DRAFT_FILE) SPEC_DRAFT_FILE="$v";;
@@ -178,7 +184,15 @@ load_config(){
   done < "$1"
 }
 
-if [[ -f "$CONFIG_FILE" ]]; then log "Reading config: $CONFIG_FILE"; load_config "$CONFIG_FILE"; else warn "Config not found; using defaults."; fi
+if [[ -f "$CONFIG_FILE" ]]; then
+  log "Reading config: $CONFIG_FILE"; load_config "$CONFIG_FILE"
+else
+  # A rerun must not silently switch an existing installation to fallback paths.
+  if [[ -f /usr/local/libexec/omp-ai-inner ]]; then
+    die "Existing OMP detected but configuration file is missing: $CONFIG_FILE. Refusing to guess MODEL_STORE/AI_HOME. Pass --config PATH."
+  fi
+  warn "Config not found; using defaults for a new install."
+fi
 
 while (($#)); do
   case "$1" in
@@ -186,6 +200,7 @@ while (($#)); do
     --model) INITIAL_MODELS+=("${2:?}"); shift 2;;
     --model-store) MODEL_STORE="${2:?}"; shift 2;;
     --draft-store) DRAFT_STORE="${2:?}"; shift 2;;
+    --llama-cdi-no-ldcache) die '--llama-cdi-no-ldcache is obsolete; NVIDIA CDI works normally after fixing the host ACL on /.';;
     --models-max) MODELS_MAX="${2:?}"; shift 2;;
     --ctx-total|--ctx) LLAMA_CTX_TOTAL="${2:?}"; shift 2;;
     --ctx-per-slot) die "--ctx-per-slot was removed; use --ctx-total N";;
@@ -198,6 +213,7 @@ while (($#)); do
     --exa-api-key) EXA_API_KEY="${2:?}"; shift 2;;
     --web-search) WEB_SEARCH_PRIMARY="${2:?}"; shift 2;;
     -y|--yes) ASSUME_YES=true; shift;;
+    --state-check) STATE_CHECK_ONLY=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "Unknown option: $1";;
   esac
@@ -243,6 +259,44 @@ case "$SPEC_DRAFT_CACHE_TYPE" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;
 case "${WEB_SEARCH_PRIMARY,,}" in auto) [[ -n "$EXA_API_KEY" ]] && WEB_SEARCH_PRIMARY=exa || WEB_SEARCH_PRIMARY=duckduckgo;; exa|duckduckgo) WEB_SEARCH_PRIMARY="${WEB_SEARCH_PRIMARY,,}";; *) die "WEB_SEARCH_PRIMARY must be auto/exa/duckduckgo";; esac
 case "${WEB_SEARCH_FALLBACK,,}" in ""|none|off) WEB_SEARCH_FALLBACK="";; exa|duckduckgo) WEB_SEARCH_FALLBACK="${WEB_SEARCH_FALLBACK,,}";; *) die "WEB_SEARCH_FALLBACK must be exa/duckduckgo/none";; esac
 [[ "$WEB_SEARCH_PRIMARY" == "$WEB_SEARCH_FALLBACK" ]] && WEB_SEARCH_FALLBACK=""
+# Critical rerun guard: inspect persistent OMP state BEFORE pacman/systemd,
+# permissions, runtime.conf generation, or any other host modifications.
+# An existing populated state without config.yml/config.yaml is RECOVERY,
+# not a first install.  Never silently seed a new role/config on top of it.
+preflight_persistent_state() {
+  local state="$AI_HOME/state" agent="$AI_HOME/state/.omp/agent"
+  local native="$agent/config.yml" compat="$agent/config.yaml"
+  local backup="$AI_HOME/backup/omp-config.last-good.yml"
+  local found=''
+  STATE_FRESH=0
+  if ! root test -d "$state"; then
+    STATE_FRESH=1
+    return 0
+  fi
+  found="$(root find "$state" -mindepth 1 -maxdepth 8       \( -type f -o -type l \) -print -quit)"
+  [[ -n "$found" ]] || return 0
+
+  if ! root test -s "$native" && ! root test -s "$compat"; then
+    warn 'Persistent OMP state exists but neither config.yml nor config.yaml is a nonempty file.'
+    if root test -s "$backup"; then
+      warn "A last-known-good backup is available: $backup"
+    else
+      warn "No nonempty last-known-good config at: $backup"
+    fi
+    die 'Refusing setup BEFORE any modification. Inspect/recover original OMP config (roles, sessions, setupVersion) first.'
+  fi
+
+  if ! root test -s "$RUNTIME_CONFIG" && ! root test -s "$LEGACY_RUNTIME_CONFIG"; then
+    die "Persistent OMP state exists but runtime.conf is missing/empty ($RUNTIME_CONFIG). Refusing to regenerate from defaults."
+  fi
+  log 'Existing OMP user config and runtime config found; preserving both.'
+}
+preflight_persistent_state
+if (( STATE_CHECK_ONLY )); then
+  ok "Read-only OMP state preflight PASSED; no installation or configuration writes."
+  exit 0
+fi
+
 if [[ -n "$EXA_API_KEY" && -f "$CONFIG_FILE" ]]; then as_main chmod 0600 "$CONFIG_FILE"; fi
 
 log "Installing packages..."
@@ -379,19 +433,24 @@ log "Podman: rootless=$podman_rootless cgroups=$podman_cgroup_version manager=$p
 [[ "$podman_cgroup_version" == v2 ]] || die "Podman requires cgroup v2 here; got: ${podman_cgroup_version:-<missing>}"
 [[ "$podman_cgroup_manager" == systemd ]] || die "Podman cgroup manager is '${podman_cgroup_manager:-<missing>}', expected 'systemd'"
 
-root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/state" "$AI_HOME/state/.omp" "$AI_HOME/state/.omp/agent" "$AI_HOME/src" "$AI_HOME/build"
+# On reruns, leave existing persistent directories' owner/mode/ACL untouched.
+for persistent_dir in "$AI_HOME/state" "$AI_HOME/state/.omp" "$AI_HOME/state/.omp/agent" "$AI_HOME/src" "$AI_HOME/build"; do
+  if ! root test -d "$persistent_dir"; then
+    root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$persistent_dir"
+  fi
+done
 # Keep a host-side last-known-good copy of the OMP settings outside /state and
 # outside the workbench mount.  OMP itself cannot touch this directory from the
 # container; the host launcher refreshes it after successful sessions.
 root install -d -o "$AI_USER" -g "$AI_GID" -m 0700 "$AI_HOME/backup"
 root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/config"
-if [[ ! -e "$RUNTIME_CONFIG" && -f "$LEGACY_RUNTIME_CONFIG" ]]; then
+if ! root_exists "$RUNTIME_CONFIG" && root test -f "$LEGACY_RUNTIME_CONFIG"; then
   log "Migrating live llama runtime config: $LEGACY_RUNTIME_CONFIG -> $RUNTIME_CONFIG"
   root install -o root -g "$AI_GID" -m 0640 "$LEGACY_RUNTIME_CONFIG" "$RUNTIME_CONFIG"
   root rm -f "$LEGACY_RUNTIME_CONFIG"
   root rmdir /etc/omp-ai 2>/dev/null || true
 fi
-if [[ ! -e "$RUNTIME_CONFIG" ]]; then
+if ! root_exists "$RUNTIME_CONFIG"; then
   log "Creating live llama runtime config: $RUNTIME_CONFIG"
   root tee "$RUNTIME_CONFIG" >/dev/null <<EOT
 # Live llama.cpp runtime tuning.
@@ -431,22 +490,34 @@ else
 fi
 root chown root:"$AI_GID" "$RUNTIME_CONFIG"
 root chmod 0640 "$RUNTIME_CONFIG"
-root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets" "$MODEL_STORE" "$DRAFT_STORE"
-# Model-store invariant: MAIN_USER can manage models directly; ompai can only read.
-# The llama container additionally mounts this tree read-only.
-root chgrp -R "$AI_GID" "$MODEL_STORE"
-root find "$MODEL_STORE" -type d -exec chmod g+rx,g-w,o-rwx,g+s {} +
-root find "$MODEL_STORE" -type f -exec chmod g+r,g-w,o-rwx {} +
-root find "$MODEL_STORE" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
-root find "$MODEL_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
-# Draft-store invariant is the same as model-store: desktop user RW, ompai read-only.
-root chgrp -R "$AI_GID" "$DRAFT_STORE"
-root find "$DRAFT_STORE" -type d -exec chmod g+rx,g-w,o-rwx,g+s {} +
-root find "$DRAFT_STORE" -type f -exec chmod g+r,g-w,o-rwx {} +
-root find "$DRAFT_STORE" -type d -exec setfacl -m "u:$MAIN_USER:rwx,g::r-x,m:rwx,o::---" -m "d:u:$MAIN_USER:rwx,d:g::r-x,d:m:rwx,d:o::---" {} +
-root find "$DRAFT_STORE" -type f -exec setfacl -m "u:$MAIN_USER:rw-,g::r--,m:rw-,o::---" {} +
+# On reruns, do not chgrp/chmod/setfacl recursively over MODEL_STORE.
+# In particular .cache/huggingface belongs to the desktop user and must remain private.
+root install -d -o root -g "$AI_GID" -m 0750 "$AI_HOME/secrets"
+for store in "$MODEL_STORE" "$DRAFT_STORE"; do
+  if [[ ! -d "$store" ]]; then
+    root install -d -o root -g "$AI_GID" -m 0750 "$store"
+  fi
+  # Grant permissions only if missing. Unmodified reruns leave existing ACLs as-is.
+  if ! as_ai test -r "$store" || ! as_ai test -x "$store"; then
+    root setfacl -m "u:$AI_USER:r-x" "$store"
+  fi
+  if ! as_main test -w "$store" || ! as_main test -x "$store"; then
+    root setfacl -m "u:$MAIN_USER:rwx" "$store"
+  fi
+  # New direct GGUF files inherit ompai read access. No recursive cache access.
+  # setfacl's update to this default entry is idempotent.
+  if ! root getfacl -cp "$store" | grep -Eq "^default:user:$AI_USER:r-x$"; then
+    root setfacl -m "d:u:$AI_USER:r-x" "$store"
+  fi
+  while IFS= read -r -d '' model_path; do
+    if ! as_ai test -r "$model_path"; then
+      root setfacl -m "u:$AI_USER:r--" "$model_path"
+      as_ai test -r "$model_path" || die "ompai cannot read GGUF after narrow ACL: $model_path"
+    fi
+  done < <(root find "$store" -mindepth 1 -maxdepth 1 -type f -iname '*.gguf' -print0)
+done
 SECRET_ENV="$AI_HOME/secrets/omp.env"
-if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else root rm -f "$SECRET_ENV"; fi
+if [[ -n "$EXA_API_KEY" ]]; then tmp="$(mktemp)"; printf 'EXA_API_KEY=%s\n' "$EXA_API_KEY" >"$tmp"; root install -o root -g "$AI_GID" -m 0640 "$tmp" "$SECRET_ENV"; rm -f "$tmp"; else log "Keeping existing secret environment unchanged (empty EXA_API_KEY)."; fi
 
 OMP_NATIVE_CONFIG="$AI_HOME/state/.omp/agent/config.yml"
 OMP_COMPAT_CONFIG="$AI_HOME/state/.omp/agent/config.yaml"
@@ -455,12 +526,12 @@ OMP_CONFIG_BACKUP="$AI_HOME/backup/omp-config.last-good.yml"
 # Never turn a missing live config into a fresh default if we have a known-good
 # copy from a previous run.  This protects user roles/settings from OMP startup
 # regressions or accidental loss of the mounted config file.
-if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$OMP_COMPAT_CONFIG" && -s "$OMP_CONFIG_BACKUP" ]]; then
+if ! root_exists "$OMP_NATIVE_CONFIG" && ! root_exists "$OMP_COMPAT_CONFIG" && root test -s "$OMP_CONFIG_BACKUP"; then
   log "Restoring missing OMP config from last-known-good backup..."
   root install -o "$AI_USER" -g "$AI_GID" -m 0600 "$OMP_CONFIG_BACKUP" "$OMP_NATIVE_CONFIG"
 fi
 
-if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$OMP_COMPAT_CONFIG" ]]; then
+if ! root_exists "$OMP_NATIVE_CONFIG" && ! root_exists "$OMP_COMPAT_CONFIG"; then
   # A non-empty agent directory with no main config is a recovery situation,
   # not a fresh install.  Refuse to seed defaults because doing so could hide
   # an OMP-quarantined/migration-lost user configuration.
@@ -468,8 +539,9 @@ if [[ ! -e "$OMP_NATIVE_CONFIG" && ! -e "$OMP_COMPAT_CONFIG" ]]; then
     die "OMP config is missing but existing OMP state is present under $AI_HOME/state/.omp/agent; refusing to create defaults. Recover config.yml/config.yaml first."
   fi
   log "Creating initial OMP native config: $OMP_NATIVE_CONFIG"
+  OMP_CONFIG_NEWLY_SEEDED=1
   root tee "$OMP_NATIVE_CONFIG" >/dev/null <<EOT
-setupVersion: 1
+setupVersion: 2
 tools:
   approvalMode: yolo
 web_search:
@@ -512,33 +584,46 @@ else
   log "Preserving OMP native config under $AI_HOME/state/.omp/agent/"
 fi
 
+# The file has just been seeded in an otherwise empty state. The existing
+# persistent directory tree (if any) must not be recursively chowned.
+if [[ "${OMP_CONFIG_NEWLY_SEEDED:-0}" == 1 ]]; then
+  root chown "$AI_USER:$AI_GID" "$OMP_NATIVE_CONFIG"
+  root chmod 0600 "$OMP_NATIVE_CONFIG"
+fi
+
 # OMP uses setupVersion as the persistent first-run/onboarding marker.
 # Preserve all user settings, but add the marker if an older installer-created
 # config predates this key; otherwise OMP can reopen its onboarding wizard on
 # an ordinary `omp-ai` launch. Never overwrite an explicit setupVersion.
 OMP_ACTIVE_CONFIG="$OMP_NATIVE_CONFIG"
-if [[ ! -e "$OMP_ACTIVE_CONFIG" && -e "$AI_HOME/state/.omp/agent/config.yaml" ]]; then
+if ! root_exists "$OMP_ACTIVE_CONFIG" && root_exists "$AI_HOME/state/.omp/agent/config.yaml"; then
   OMP_ACTIVE_CONFIG="$AI_HOME/state/.omp/agent/config.yaml"
 fi
-if [[ -e "$OMP_ACTIVE_CONFIG" ]] && ! grep -Eq '^[[:space:]]*setupVersion[[:space:]]*:' "$OMP_ACTIVE_CONFIG"; then
-  log "Adding missing OMP onboarding marker (setupVersion: 1) without changing user settings..."
-  printf '\nsetupVersion: 1\n' | root tee -a "$OMP_ACTIVE_CONFIG" >/dev/null
+if root_exists "$OMP_ACTIVE_CONFIG" && ! root grep -Eq '^[[:space:]]*setupVersion[[:space:]]*:' "$OMP_ACTIVE_CONFIG"; then
+  log "Adding missing OMP onboarding marker (setupVersion: 2) without changing user settings..."
+  printf '\nsetupVersion: 2\n' | root tee -a "$OMP_ACTIVE_CONFIG" >/dev/null
 fi
 # Snapshot the exact live user config after the conservative setup handling
 # above.  Future setup reruns and launcher starts can restore it byte-for-byte.
 OMP_LIVE_CONFIG=""
-if [[ -e "$OMP_NATIVE_CONFIG" ]]; then OMP_LIVE_CONFIG="$OMP_NATIVE_CONFIG";
-elif [[ -e "$OMP_COMPAT_CONFIG" ]]; then OMP_LIVE_CONFIG="$OMP_COMPAT_CONFIG"; fi
-if [[ -n "$OMP_LIVE_CONFIG" ]]; then
+if root_exists "$OMP_NATIVE_CONFIG"; then OMP_LIVE_CONFIG="$OMP_NATIVE_CONFIG";
+elif root_exists "$OMP_COMPAT_CONFIG"; then OMP_LIVE_CONFIG="$OMP_COMPAT_CONFIG"; fi
+if [[ -n "$OMP_LIVE_CONFIG" ]] && ! root test -s "$OMP_CONFIG_BACKUP"; then
+  # Seed only once. An existing last-known-good backup is never overwritten by setup.
   root install -o "$AI_USER" -g "$AI_GID" -m 0600 "$OMP_LIVE_CONFIG" "$OMP_CONFIG_BACKUP"
 fi
 
-root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
-root chmod -R go-rwx "$AI_HOME/state"
-# Access invariant for agent-visible state: MAIN_USER >= ompai.
-# OMP writes /state; the desktop user can inspect/edit the same files directly.
-root setfacl -R -m "u:$MAIN_USER:rwX" "$AI_HOME/state"
-root find "$AI_HOME/state" -type d -exec setfacl -m "d:u:$MAIN_USER:rwx,d:m:rwx" {} +
+# Only the initial creation of /state requires bootstrap ownership and ACLs.
+# A rerun must NEVER chmod/chown/setfacl recursively across workbench state,
+# sessions, databases, installed tools, or user-managed files.
+if (( STATE_FRESH )); then
+  root chown -R "$AI_USER:$AI_GID" "$AI_HOME/state"
+  root chmod -R go-rwx "$AI_HOME/state"
+  root setfacl -R -m "u:$MAIN_USER:rwX" "$AI_HOME/state"
+  root find "$AI_HOME/state" -type d -exec setfacl -m "d:u:$MAIN_USER:rwx,d:m:rwx" {} +
+else
+  log 'Preserving existing /state ownership, modes and ACLs without recursive modifications.'
+fi
 
 validate_model(){
   local src="$1" f found=0
@@ -553,7 +638,7 @@ for raw in "${INITIAL_MODELS[@]}"; do
   [[ "$raw" == '~/'* ]] && raw="$MAIN_HOME/${raw#~/}"
   src="$(realpath -e "$raw")"; validate_model "$src"; name="$(basename "$src")"; dest="$MODEL_STORE/$name"
   [[ -e "$dest" ]] && { log "Model already exists, skipping: $name"; continue; }
-  tmp="$MODEL_STORE/.import-$name.$$"; root rm -rf "$tmp"
+  tmp="$MODEL_STORE/.import-$name.$$"; [[ ! -e "$tmp" ]] || die "Import temporary path already exists; refusing to overwrite: $tmp"
   [[ -f "$src" ]] && root cp --reflink=auto --sparse=always "$src" "$tmp" || root cp -a --reflink=auto "$src" "$tmp"
   root chown -R root:"$AI_GID" "$tmp"
   [[ -d "$tmp" ]] && {
@@ -708,7 +793,11 @@ root rm -rf "$AI_HOME/src/oh-my-pi" 2>/dev/null || true
 root rmdir "$AI_HOME/src" 2>/dev/null || true
 
 log "Building/updating lightweight OMP runtime from the official prebuilt binary..."
-as_ai "$OMP_UPDATE_HELPER" rebuild-base
+if as_ai podman image exists localhost/omp:latest >/dev/null 2>&1 && [[ -z "$OMP_VERSION" ]]; then
+  log "Preserving existing OMP base image; no unnecessary rebuild on setup rerun."
+else
+  as_ai "$OMP_UPDATE_HELPER" rebuild-base
+fi
 
 # OMP user configuration under /state/.omp is persistent user state.
 # The installer seeds config.yml only on first install (when it does not exist).
@@ -716,7 +805,11 @@ as_ai "$OMP_UPDATE_HELPER" rebuild-base
 # settings are left exactly as the user configured them.
 log "Preserving OMP user configuration and model roles..."
 
-as_ai podman pull "$LLAMA_IMAGE"
+if as_ai podman image exists "$LLAMA_IMAGE" >/dev/null 2>&1; then
+  log "Preserving existing llama.cpp image ($LLAMA_IMAGE)."
+else
+  as_ai podman pull "$LLAMA_IMAGE"
+fi
 
 # Rebuilding localhost/omp:latest does not mutate an already-created writable
 # workbench rootfs. Preserve it rather than silently deleting user-installed
@@ -727,17 +820,6 @@ as_ai podman pull "$LLAMA_IMAGE"
 # Start the lightweight sleep container temporarily, update the live cgroup +
 # stored config, verify the value, then restore its previous stopped state.
 if as_ai timeout --kill-after=3s 20s podman container exists ompai-workbench 2>/dev/null; then
-  log "Applying persistent workbench memory limit: $OMP_MEM"
-  wb_was_running="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.State.Running}}' ompai-workbench 2>/dev/null || echo false)"
-  if [[ "$wb_was_running" != true ]]; then
-    as_ai timeout --kill-after=3s 20s podman start ompai-workbench >/dev/null || die "Failed to start ompai-workbench for resource-limit update"
-  fi
-
-  if ! as_ai timeout --kill-after=3s 20s podman update --memory="$OMP_MEM" ompai-workbench >/dev/null; then
-    [[ "$wb_was_running" == true ]] || as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
-    die "Failed to update ompai-workbench memory limit to $OMP_MEM"
-  fi
-
   # Convert the configured IEC size to bytes for an exact post-update check.
   expected_wb_mem="$(python - "$OMP_MEM" <<'PYMEM'
 import re, sys
@@ -750,11 +832,23 @@ print(n * (1024 ** ({'':0,'k':1,'m':2,'g':3,'t':4}[u])))
 PYMEM
 )"
   actual_wb_mem="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.HostConfig.Memory}}' ompai-workbench 2>/dev/null || echo 0)"
-
-  if [[ "$wb_was_running" != true ]]; then
-    as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+  if [[ "$actual_wb_mem" == "$expected_wb_mem" ]]; then
+    log "Existing persistent workbench already has $OMP_MEM; skipping start/update/stop."
+  else
+    log "Updating persistent workbench memory limit: $actual_wb_mem -> $expected_wb_mem bytes"
+    wb_was_running="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.State.Running}}' ompai-workbench 2>/dev/null || echo false)"
+    if [[ "$wb_was_running" != true ]]; then
+      as_ai timeout --kill-after=3s 20s podman start ompai-workbench >/dev/null || die "Failed to start persistent workbench for resource-limit update"
+    fi
+    if ! as_ai timeout --kill-after=3s 20s podman update --memory="$OMP_MEM" ompai-workbench >/dev/null; then
+      [[ "$wb_was_running" == true ]] || as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+      die "Failed to update persistent workbench memory"
+    fi
+    actual_wb_mem="$(as_ai timeout --kill-after=3s 20s podman inspect -f '{{.HostConfig.Memory}}' ompai-workbench 2>/dev/null || echo 0)"
+    if [[ "$wb_was_running" != true ]]; then
+      as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
+    fi
   fi
-
   [[ "$actual_wb_mem" == "$expected_wb_mem" ]] || die "Podman did not persist ompai-workbench memory limit: wanted $OMP_MEM ($expected_wb_mem bytes), inspect reports $actual_wb_mem bytes"
   ok "Persistent workbench memory limit verified: $OMP_MEM ($actual_wb_mem bytes)"
 
@@ -764,7 +858,12 @@ PYMEM
     warn "To migrate the workbench OS, run: omp-ai stop && omp-ai reset-env  (this removes packages installed inside the old workbench rootfs)."
   fi
 fi
-as_ai timeout --kill-after=5s 180s podman run --rm --device nvidia.com/gpu=all docker.io/library/ubuntu:24.04 nvidia-smi -L >/dev/null || die "Rootless Podman cannot use NVIDIA CDI"
+# Check using the same immutable CUDA server image and hardened GPU options as the router.
+as_ai timeout --kill-after=5s 180s podman run --rm --pull=never \
+  --network none --device nvidia.com/gpu=all --read-only --cap-drop ALL \
+  --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+  --entrypoint /bin/sh "$LLAMA_IMAGE" -c 'nvidia-smi -L' >/dev/null || \
+  die "Rootless hardened NVIDIA CDI probe failed; inspect host/CDI ACLs and hook stderr before modifying Podman security."
 
 root install -d -m 0755 /usr/local/libexec
 
@@ -856,7 +955,10 @@ root "$SHARE_HELPER" prepare
 
 # ----- shared llama router + persistent OMP workbench helper -----
 INNER="/usr/local/libexec/omp-ai-inner"
-root tee "$INNER" >/dev/null <<EOT
+# Atomic + content-idempotent launcher installation: reruns do not truncate an
+# executable that may be in use by live sessions, or rewrite unchanged bytes.
+INNER_TMP="$(root mktemp /usr/local/libexec/.omp-ai-inner.XXXXXXXX)"
+root tee "$INNER_TMP" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
 AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; WEB_SEARCH_PRIMARY="$WEB_SEARCH_PRIMARY"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
@@ -1079,8 +1181,67 @@ start_router(){
   if [[ "\$(pctl inspect -f '{{.State.Running}}' "\$LLAMA_NAME" 2>/dev/null || true)" == true ]] && healthy; then return 0; fi
   pctl rm -f -t 5 "\$LLAMA_NAME" >/dev/null 2>&1 || true
   make_models_preset || return \$?
+  # Export only direct GGUF files into a private model view. Never bind the full
+  # MODEL_STORE: llama.cpp router recursively scans --models-dir, including the
+  # desktop user's private .cache/huggingface tree. No ACL modifications, no
+  # GGUF copies. The empty placeholders are mount targets, not model data.
+  local model_view="\$XDG_RUNTIME_DIR/omp-ai-model-view"
+  if [[ -L "\$model_view" ]]; then
+    echo '[omp-ai] ERROR: model view is a symlink; refusing unsafe mount target.' >&2
+    return 4
+  fi
+  install -d -m 0700 -- "\$model_view" || return 4
+  chmod 0700 -- "\$model_view" || return 4
+  local src name model_count=0
+  local -a model_mounts=(--mount "type=bind,src=\$model_view,dst=/models,ro=true,bind-nonrecursive")
+  # The directory is dedicated to zero-byte placeholders from this launcher.
+  # Remove obsolete placeholders so a removed model is not falsely discovered.
+  find "\$model_view" -mindepth 1 -maxdepth 1 -type f -iname '*.gguf' -delete || return 4
+  # Remove only our empty bundle mount points; refuse if somebody put data there.
+  find "\$model_view" -mindepth 1 -maxdepth 1 -type d -exec rmdir -- {} + || return 4
+  while IFS= read -r -d '' src; do
+    name="\${src##*/}"
+    if [[ "\$name" == *,* || "\$name" == *:* || "\$name" == *$'\\n'* ]]; then
+      echo "[omp-ai] ERROR: unsupported GGUF filename in bind mount: \$name" >&2
+      return 4
+    fi
+    if [[ ! -r "\$src" ]] || [[ "\$(head -c 4 -- "\$src" 2>/dev/null || :)" != GGUF ]]; then
+      echo "[omp-ai] ERROR: missing access or invalid GGUF header: \$src" >&2
+      return 4
+    fi
+    if [[ -e "\$model_view/\$name" || -L "\$model_view/\$name" ]]; then
+      echo "[omp-ai] ERROR: unexpected model-view entry: \$name" >&2
+      return 4
+    fi
+    : >"\$model_view/\$name" || return 4
+    chmod 0400 -- "\$model_view/\$name" || return 4
+    model_mounts+=(--mount "type=bind,src=\$src,dst=/models/\$name,ro=true,bind-nonrecursive")
+    model_count=\$((model_count+1))
+  done < <(find "\$MODEL_STORE" -mindepth 1 -maxdepth 1 -type f -iname '*.gguf' -print0)
+  # Preserve llama.cpp bundle support (sharded or multimodal GGUF in a
+  # dedicated subdirectory). Do not expose dot-directories such as .cache.
+  while IFS= read -r -d '' src; do
+    name="\${src##*/}"
+    [[ -n "\$(find "\$src" -mindepth 1 -maxdepth 1 -type f -iname '*.gguf' -print -quit 2>/dev/null)" ]] || continue
+    if [[ "\$name" == *,* || "\$name" == *:* || "\$name" == *$'\n'* ]]; then
+      echo "[omp-ai] ERROR: unsupported model bundle name: \$name" >&2
+      return 4
+    fi
+    if [[ -e "\$model_view/\$name" || -L "\$model_view/\$name" ]]; then
+      echo "[omp-ai] ERROR: unexpected bundle-view entry: \$name" >&2
+      return 4
+    fi
+    install -d -m 0500 -- "\$model_view/\$name" || return 4
+    model_mounts+=(--mount "type=bind,src=\$src,dst=/models/\$name,ro=true,bind-nonrecursive")
+    model_count=\$((model_count+1))
+  done < <(find "\$MODEL_STORE" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0)
+  if (( model_count == 0 )); then
+    echo '[omp-ai] ERROR: no accessible GGUF files at model-store top level.' >&2
+    return 4
+  fi
+  echo "[omp-ai] Exposing \$model_count GGUF models via read-only individual mounts; private model cache is not mounted."
   echo "[omp-ai] Starting shared llama.cpp router: parallel=\$LLAMA_PARALLEL; work=\$WORK_MODEL/\$WORK_CTX_TOTAL/\$WORK_CACHE_TYPE_K; slow=\$SPEC_TARGET_MODEL/\$SPEC_CTX_TOTAL/\$SPEC_CACHE_TYPE_K+\$SPEC_MODE"
-  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m --mount "type=bind,src=\$MODEL_STORE,dst=/models,ro=true,bind-nonrecursive" --mount "type=bind,src=\$DRAFT_STORE,dst=/drafts,ro=true,bind-nonrecursive" --mount "type=bind,src=\$LLAMA_MODELS_PRESET,dst=/config/models.ini,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
+  pctl run -d --name "\$LLAMA_NAME" --replace --network omp-llm --network-alias llama --device nvidia.com/gpu=all -e "LLAMA_ARG_LOG_VERBOSITY=\$LLAMA_LOG_VERBOSITY" --memory "\$LLAMA_MEM" --cpus 20 --pids-limit 512 --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=512m "\${model_mounts[@]}" --mount "type=bind,src=\$DRAFT_STORE,dst=/drafts,ro=true,bind-nonrecursive" --mount "type=bind,src=\$LLAMA_MODELS_PRESET,dst=/config/models.ini,ro=true,bind-nonrecursive" -p "127.0.0.1:\$LLAMA_PORT:8080" "\$LLAMA_IMAGE" \
     --models-dir /models --models-preset /config/models.ini --models-max "\$MODELS_MAX" --models-autoload \
     --host 0.0.0.0 --port 8080 --metrics \
     --parallel "\$LLAMA_PARALLEL" \
@@ -1186,7 +1347,7 @@ while (( \$# )); do case "\$1" in --workdir) workdir_rel="\${2:-}"; shift 2;; --
 
 candidate="\$(realpath -m "\$WORKSPACE/\$workdir_rel")"; case "\$candidate" in "\$WORKSPACE"|"\$WORKSPACE"/*) ;; *) exit 2;; esac; [[ -d "\$candidate" ]] || exit 2
 container_workdir=/workspace; [[ "\$candidate" != "\$WORKSPACE" ]] && container_workdir="/workspace/\${candidate#"\$WORKSPACE/"}"
-find "\$MODEL_STORE" -type f -iname '*.gguf' -print -quit | grep -q . || { echo "No models. Use ai-model add ..." >&2; exit 3; }
+[[ -n "\$(find "\$MODEL_STORE" -mindepth 1 -maxdepth 1 -type f -iname '*.gguf' -print -quit)" ]] || { echo "No models. Use ai-model add ..." >&2; exit 3; }
 SESSION_ID="\$(cat /proc/sys/kernel/random/uuid)"; MARKER="\$SESS_DIR/\$SESSION_ID.session"; HB_PID=""
 
 with_lock || exit 6; start_router || { unlock; exit 5; }; ensure_workbench; proc_start="\$(awk '{print \$22}' /proc/\$\$/stat 2>/dev/null || true)"; printf '%s\n%s\n%s\n' "\$SESSION_ID" "\$\$" "\$proc_start" >"\$MARKER"; unlock
@@ -1251,8 +1412,14 @@ set -e
 snapshot_omp_config
 exit "\$rc"
 EOT
-root chmod 0755 "$INNER"
-root bash -n "$INNER"
+root chmod 0755 "$INNER_TMP"
+root bash -n "$INNER_TMP"
+if root cmp -s -- "$INNER_TMP" "$INNER"; then
+  root rm -f -- "$INNER_TMP"
+  log "Installed inner launcher already matches; preserving inode and timestamps."
+else
+  root mv -f -- "$INNER_TMP" "$INNER"
+fi
 
 # ----- public wrapper -----
 PUBLIC="/usr/local/bin/omp-ai"
@@ -1353,24 +1520,19 @@ WantedBy=timers.target
 EOT
 root systemctl daemon-reload; root systemctl enable --now omp-ai-reaper.timer
 
-# Maintenance cleanup after rewriting helpers. Never interrupt a live OMP
-# session just because setup was re-run: active sessions keep using the
-# already-running workbench/router, and the new helpers/config take effect on
-# the next launch.
+# Idempotent maintenance: do not delete/recreate/stop *any* existing OMP
+# container or session, even if session markers are absent. A shell may be
+# using the persistent workbench independently. Updated helpers take effect
+# the next time they are invoked; if llama is already healthy, its existing
+# instance remains untouched until the user explicitly stops it.
 shopt -s nullglob
 active_markers=("$AI_RUNTIME/omp-ai-sessions"/*.session)
 shopt -u nullglob
 if (( ${#active_markers[@]} )); then
-  warn "Active OMP session(s) detected; leaving the running workbench/router/session markers untouched."
-  warn "New helper code will apply after those sessions exit. Live llama tuning applies after: omp-ai stop && omp-ai"
+  warn "Active OMP sessions: setup leaves running containers untouched."
 else
-  mapfile -t old_agents < <(as_ai timeout --kill-after=3s 20s podman ps -a --format '{{.Names}}' | grep '^ompai-agent-' || true)
-  (( ${#old_agents[@]} )) && as_ai timeout --kill-after=3s 20s podman rm -f -t 5 "${old_agents[@]}" >/dev/null 2>&1 || true
-  as_ai timeout --kill-after=3s 20s podman rm -f -t 5 ompai-agent ompai-llama >/dev/null 2>&1 || true
-  as_ai timeout --kill-after=3s 20s podman stop -t 5 ompai-workbench >/dev/null 2>&1 || true
-  as_ai rm -rf "$AI_RUNTIME/omp-ai-sessions" >/dev/null 2>&1 || true
+  log "Preserving all existing Podman containers and session markers on rerun."
 fi
-root "$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true
 
 ok "Setup complete"
 echo "Workspace:        $WORKSPACE"
