@@ -57,6 +57,12 @@ AI_SLICE_CPU="2400%"
 EXA_API_KEY=""
 WEB_SEARCH_PRIMARY="auto"
 WEB_SEARCH_FALLBACK="duckduckgo"
+# Used only when *creating* cloud/local OMP named profiles. Existing files are kept.
+CLOUD_PRIMARY_MODEL="openai-codex/gpt-5.5:high"
+CLOUD_PLAN_MODEL="openai-codex/gpt-5.5:xhigh"
+CLOUD_FALLBACK_MODEL="deepseek/deepseek-v4-pro:xhigh"
+LOCAL_PRIMARY_MODEL="Qwen3.6-35B-A3B-Q4_K_M"
+LOCAL_RARE_MODEL="Qwen3.8-27B-Q4_K_M"
 HARDEN_HOME="true"
 ASSUME_YES="false"
 STATE_CHECK_ONLY=0
@@ -166,6 +172,8 @@ set_cfg(){
     OMP_MEM) OMP_MEM="$v";;
     AI_SLICE_MEM) AI_SLICE_MEM="$v";; AI_SLICE_CPU) AI_SLICE_CPU="$v";;
     EXA_API_KEY) EXA_API_KEY="$v";; WEB_SEARCH_PRIMARY) WEB_SEARCH_PRIMARY="$v";; WEB_SEARCH_FALLBACK) WEB_SEARCH_FALLBACK="$v";;
+    CLOUD_PRIMARY_MODEL) CLOUD_PRIMARY_MODEL="$v";; CLOUD_PLAN_MODEL) CLOUD_PLAN_MODEL="$v";; CLOUD_FALLBACK_MODEL) CLOUD_FALLBACK_MODEL="$v";;
+    LOCAL_PRIMARY_MODEL) LOCAL_PRIMARY_MODEL="$v";; LOCAL_RARE_MODEL) LOCAL_RARE_MODEL="$v";;
     HARDEN_HOME) HARDEN_HOME="$v";; ASSUME_YES) ASSUME_YES="$v";; "") ;;
     *) die "Unknown config key: $k";;
   esac
@@ -663,6 +671,241 @@ SHARE_STAGE="/run/omp-ai-shares"
 root install -d -o root -g root -m 0711 "$SHARE_STAGE"
 if ! root mountpoint -q "$SHARE_STAGE"; then root mount --bind "$SHARE_STAGE" "$SHARE_STAGE"; fi
 root mount --make-rshared "$SHARE_STAGE"
+
+# ----- standalone native OMP cloud/local profiles -----
+# OMP relocates ~/.omp/agent to ~/.omp/profiles/<name>/agent. We initialize
+# only missing files and do not touch the original default profile or existing
+# named-profile sessions, auth stores, agents, or user modifications.
+log "Seeding cloud/local OMP named profiles (only missing files)..."
+root python3 - "$AI_HOME/state/.omp" "$AI_UID" "$AI_GID" "$CLOUD_PRIMARY_MODEL" "$CLOUD_PLAN_MODEL" "$CLOUD_FALLBACK_MODEL" "$LOCAL_PRIMARY_MODEL" "$LOCAL_RARE_MODEL" <<'PYPROFILES'
+import os, pathlib, sys, tempfile
+base = pathlib.Path(sys.argv[1]); uid, gid = map(int,sys.argv[2:4])
+cloud_default, cloud_plan, deepseek, local_main, local_rare = sys.argv[4:]
+for selector in (cloud_default, cloud_plan, deepseek, local_main, local_rare):
+    if not selector or any(c in selector for c in '\n\r\t"\\'):
+        raise SystemExit('Unsafe or empty model selector in cloud/local profile config')
+# All paths derive from the known, root-owned installer settings; no user YAML is overwritten.
+def mkdir(path):
+    if not path.exists():
+        path.mkdir(mode=0o700, parents=True)
+        os.chown(path, uid, gid)
+    if not path.is_dir() or path.is_symlink():
+        raise SystemExit(f'Invalid OMP profile directory: {path}')
+
+def newfile(path, content):
+    if path.exists() or path.is_symlink():
+        print(f'[omp-ai] preserving profile file: {path}')
+        return
+    mkdir(path.parent)
+    fd, tmp = tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        os.fchown(fd,uid,gid)
+        with os.fdopen(fd,'w',encoding='utf-8') as file:
+            file.write(content)
+        # Hard-link creation is no-clobber; no silent replacement in an interrupted rerun.
+        try: os.link(tmp,path,follow_symlinks=False)
+        except FileExistsError: pass
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+def model_yaml(include_deepseek):
+    source = '''providers:
+  llama.cpp:
+    baseUrl: http://llama:8080
+    auth: none
+    api: openai-responses
+    discovery:
+      type: llama.cpp
+    modelOverrides:
+      Qwen3.6-35B-A3B-Q4_K_M:
+        contextWindow: 32768
+        maxContextWindow: 32768
+      Qwen3.8-27B-Q4_K_M:
+        contextWindow: 32768
+        maxContextWindow: 32768
+      Qwen3.5-9B-Q4_K_M:
+        contextWindow: 65536
+        maxContextWindow: 65536
+'''
+    if include_deepseek:
+        source += '''  deepseek:
+    baseUrl: https://api.deepseek.com
+    api: openai-completions
+    apiKey: DEEPSEEK_API_KEY
+    authHeader: true
+    models:
+      - id: deepseek-v4-pro
+        name: DeepSeek V4 Pro
+        reasoning: true
+        thinking:
+          minLevel: high
+          maxLevel: xhigh
+          mode: effort
+        input: [text]
+        contextWindow: 1000000
+        maxTokens: 384000
+        compat:
+          supportsDeveloperRole: false
+          supportsReasoningEffort: true
+          maxTokensField: max_tokens
+          reasoningEffortMap:
+            high: high
+            xhigh: max
+          supportsToolChoice: false
+          requiresReasoningContentForToolCalls: true
+          requiresAssistantContentForToolCalls: true
+          extraBody:
+            thinking:
+              type: enabled
+'''
+    return source
+
+local_default = f'llama.cpp/{local_main}:max'
+local_slow = f'llama.cpp/{local_rare}:xhigh'
+local = f'''setupVersion: 2
+tools:
+  approvalMode: yolo
+web_search:
+  enabled: false
+fetch:
+  enabled: true
+browser:
+  enabled: false
+computer:
+  enabled: false
+modelRoleStorage: global
+modelRoles:
+  default: {local_default}
+  smol: {local_default}
+  slow: {local_slow}
+  rare: {local_slow}
+  plan: {local_default}
+  commit: {local_default}
+  tiny: {local_default}
+  memory: {local_default}
+  task: {local_default}
+  advisor: {local_default}
+cycleOrder:
+  - default
+  - slow
+advisor:
+  enabled: false
+retry:
+  modelFallback: false
+  fallbackChains:
+    default: []
+    slow: []
+    plan: []
+    task: []
+'''
+cloud = f'''setupVersion: 2
+tools:
+  approvalMode: yolo
+web_search:
+  enabled: true
+fetch:
+  enabled: true
+browser:
+  enabled: false
+computer:
+  enabled: false
+modelRoleStorage: global
+modelRoles:
+  default: {cloud_default}
+  plan: {cloud_plan}
+  slow: {cloud_plan}
+  smol: {local_default}
+  local_coder: {local_default}
+  commit: {local_default}
+  tiny: {local_default}
+  memory: {local_default}
+  task: {cloud_plan}
+  advisor: {cloud_plan}
+  web: web/duckduckgo
+cycleOrder:
+  - default
+  - slow
+advisor:
+  enabled: false
+task:
+  agentModelOverrides:
+    sonic: "@local_coder"
+retry:
+  enabled: true
+  modelFallback: true
+  fallbackChains:
+    default:
+      - {deepseek}
+    plan:
+      - {deepseek}
+    slow:
+      - {deepseek}
+    task:
+      - {deepseek}
+    smol: []
+    commit: []
+    tiny: []
+    memory: []
+'''
+agent = '''---
+name: local-coder
+description: Implement small, narrowly scoped code changes locally; use for simple bug fixes, tests, refactors and shell commands
+model: "@local_coder"
+blocking: true
+---
+
+You are the locally hosted coding worker. Carry out only the bounded coding task requested.
+Inspect relevant files, make minimal changes, run targeted checks and report exact results.
+If the request requires architectural decisions or broad design tradeoffs, stop and hand back
+the tradeoffs to the parent cloud agent instead of deciding them alone.
+Do not assume your model can access arbitrary host paths; honor workspace shares.
+'''
+policy = '''# Cloud profile task delegation policy
+For complex design, architectural reasoning, security review and ambiguous decisions,
+use the cloud primary model. For small, clearly specified file edits, shell work,
+test fixes and routine code changes, prefer spawning the `local-coder` task agent.
+Provide a bounded task, necessary context and acceptance criteria. Review its output
+and tests before declaring success. If the local agent cannot access a path, ask for
+an explicit share; do not widen host mounts or permissions.
+This is model-guided delegation, not a guaranteed automatic classifier.
+'''
+mkdir(base/'profiles')
+rare_agent = '''---
+name: rare-planner
+description: Second opinion for rare difficult planning, verification and deep debugging cases
+model: "@rare"
+blocking: true
+---
+
+You are a second-opinion planner on a slower local model. Analyze the difficult
+question carefully, compare alternatives, identify failure modes, and return
+a concrete recommendation with uncertainties. Do not edit files unless the
+parent explicitly requests it. Your model is CPU/GPU hybrid and slow.
+'''
+rare_policy = '''# Local profile difficult-task policy
+Use Qwen3.6-35B-A3B as the primary model for normal work, coding and planning.
+Only for rare, genuinely difficult questions where an independent second opinion
+would help, dispatch the `rare-planner` subagent before deciding. Avoid invoking
+it for routine tasks because the dense 27B is much slower and not necessarily
+stronger. Review the second opinion critically; do not assume it is correct.
+This is model-guided routing, not a guaranteed automatic classifier.
+'''
+for name, cfg, ds in [('local', local, False),('cloud',cloud,True)]:
+    mkdir(base/'profiles'/name)
+    root = base/'profiles'/name/'agent'
+    mkdir(root)
+    newfile(root/'config.yml',cfg)
+    newfile(root/'models.yml',model_yaml(ds))
+    if name=='cloud':
+        newfile(root/'agents'/'local-coder.md',agent)
+        newfile(root/'APPEND_SYSTEM.md',policy)
+    else:
+        newfile(root/'agents'/'rare-planner.md',rare_agent)
+        newfile(root/'APPEND_SYSTEM.md',rare_policy)
+print('[omp-ai] Profiles initialized/preserved: local, cloud; default untouched.')
+PYPROFILES
 
 # ----- OMP updater -----
 # The runtime uses a persistent writable workbench container.  If the
@@ -1266,6 +1509,45 @@ kill_exec_session(){
   rm -f "\$meta"
 }
 case "\${1:-}" in
+  native-has)
+    shift
+    [[ "\$#" == 1 ]] || exit 1
+    # Internal completion subcommand is intentionally hidden from --help.
+    # Let OMP own this documented interface rather than loading the router.
+    [[ "\$1" == __complete ]] && exit 0
+    [[ "\$1" =~ ^[a-z][a-z0-9-]*$ ]] || exit 1
+    # 0=registered, 1=not registered, 2=unable to inspect installed OMP.
+    # Do not misinterpret an unavailable workbench as an unknown command.
+    ensure_workbench || exit 2
+    native_help="\$(pctl exec "\$WORKBENCH" /usr/local/bin/omp --help 2>/dev/null)" || exit 2
+    [[ -n "\$native_help" ]] || exit 2
+    awk -v wanted="\$1" '
+      /^  [a-z][a-z0-9-]+[[:space:]][[:space:]]/ && \$1 == wanted { found=1 }
+      END { exit(found ? 0 : 1) }' <<<"\$native_help"
+    exit \$?;;
+  native-cli)
+    shift
+    native_workdir=""
+    if [[ "\${1:-}" == --workdir ]]; then native_workdir="\${2:-}"; shift 2; fi
+    [[ "\${1:-}" == -- ]] || { echo 'Bad native-cli invocation' >&2; exit 2; }
+    shift
+    native_target="\$(realpath -m "\$WORKSPACE/\$native_workdir")"
+    case "\$native_target" in "\$WORKSPACE"|"\$WORKSPACE"/*) ;; *) exit 2;; esac
+    [[ -d "\$native_target" ]] || exit 2
+    native_cwd=/workspace
+    [[ "\$native_target" != "\$WORKSPACE" ]] && native_cwd="/workspace/\${native_target#"\$WORKSPACE/"}"
+    ensure_workbench
+    native_secrets=(); [[ -r "\$SECRET_ENV" ]] && native_secrets+=(--env-file "\$SECRET_ENV")
+    native_tty=(); [[ -t 0 && -t 1 ]] && native_tty=(-it)
+    # CLI subcommands (login/config/models/update/...) run in original persistent
+    # workbench, with original argv and original named-profile isolation.
+    # Do not add OMP_PROFILE= or PI_CODING_AGENT_DIR (both break native profiles).
+    # No OMP agent configuration or sessions are modified by the launcher.
+    exec podman exec "\${native_tty[@]}" --workdir "\$native_cwd" "\${native_secrets[@]}" \
+      -e HOME=/state -e "TERM=\${TERM:-xterm}" \
+      "\$WORKBENCH" /usr/local/bin/omp "\$@";;
+esac
+case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
     printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nWORK_MODEL=%s\nWORK_CTX_TOTAL=%s\nWORK_CACHE_TYPE_K=%s\nWORK_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_CTX_TOTAL=%s\nSPEC_CACHE_TYPE_K=%s\nSPEC_CACHE_TYPE_V=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
@@ -1317,7 +1599,7 @@ case "\${1:-}" in
   logs) shift; exec podman logs -f "\$LLAMA_NAME";;
   shell)
     ensure_workbench
-    set +e; podman exec -it -e HOME=/state -e PI_CODING_AGENT_DIR=/state/.omp/agent -e OMP_PROFILE= --workdir /workspace "\$WORKBENCH" /bin/bash; rc=\$?; set -e
+    set +e; podman exec -it -e HOME=/state --workdir /workspace "\$WORKBENCH" /bin/bash; rc=\$?; set -e
     has_sessions || pctl stop -t 10 "\$WORKBENCH" >/dev/null 2>&1 || true
     exit "\$rc";;
   reset-env)
@@ -1397,7 +1679,7 @@ if [[ -t 0 && -t 1 ]]; then exec_tty=(-it); fi
 restore_omp_config_if_missing
 set +e
 podman exec "\${exec_tty[@]}" --workdir "\$container_workdir" "\${secret_args[@]}" \
-  -e HOME=/state -e PI_CODING_AGENT_DIR=/state/.omp/agent -e OMP_PROFILE= \
+  -e HOME=/state \
   -e "TERM=\${TERM:-xterm}" -e LLAMA_CPP_BASE_URL=http://llama:8080 -e "OMP_SESSION_ID=\$SESSION_ID" \
   "\$WORKBENCH" /bin/bash -lc '
     set -e
@@ -1423,25 +1705,104 @@ fi
 
 # ----- public wrapper -----
 PUBLIC="/usr/local/bin/omp-ai"
-root tee "$PUBLIC" >/dev/null <<EOT
+PUBLIC_TMP="$(root mktemp /usr/local/bin/.omp-ai.XXXXXXXX)"
+root tee "$PUBLIC_TMP" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
 INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"; WORKSPACE="$WORKSPACE"; AI_USER="$AI_USER"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
-case "\${1:-}" in
-  stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
-  status|logs|stats) exec sudo -n -u "\$AI_USER" "\$INNER" "\$@";;
-  config)
+# Always honor a real OMP subcommand before a homonymous host-wrapper command.
+# For host operations, use explicit host-* names to avoid future collisions.
+# Native OMP always owns its registered commands and all of its flags.
+# Parse *only* enough leading options to locate the first positional command;
+# keep the ORIGINAL argv intact for native and managed execution.
+# Unknown future OMP options are passed to the managed OMP launcher as-is.
+dispatch_args=("\$@")
+# Work from the original CLI tokens, so --profile is valid before or after
+# other launch flags and native commands can follow launch flags.
+scan=("\${dispatch_args[@]}")
+host_cmd=''; dispatch_is_candidate=0; unknown_leading_option=0
+for (( scan_i=0; scan_i < \${#scan[@]}; scan_i++ )); do
+  token="\${scan[scan_i]}"
+  case "\$token" in
+    --) break;;
+    # Optional argument / resume flags: let OMP do the parsing unchanged.
+    -r|--resume|--session|--list-models) break;;
+    # Standard options which consume one following argument.
+    --profile|--cwd|--add-dir|--alias|--config|--session-dir|--fork|--from-claude|--from-codex|--export|--model|--smol|--slow|--plan|--models|--provider|--api-key|--provider-session-id|--prompt-cache-key|--service-tier|--thinking|--prewalk-into|--plan-yolo-into|--goal|--tools|--approval-mode|--max-time|--extension|-e|--hook|--trusted-extension|--plugin-dir|--skills|--system-prompt|--system-prompt-template|--append-system-prompt|--mode|--workdir)
+      (( ++scan_i ));;
+    --*=*) ;;
+    --*|-*)
+      case "\$token" in
+        -c|-p|-h|-v|--continue|--print|--help|--version|--no-session|--no-title|--hide-thinking|--print-thoughts|--external-thinking|--prewalk|--no-prewalk|--plan-yolo|--no-tools|--no-lsp|--no-pty|--auto-approve|--yolo|--advisor|--no-extensions|--no-skills|--no-rules|--no-ui|--allow-home) ;;
+        *) unknown_leading_option=1; break;;
+      esac;;
+    @*) break;;
+    *) host_cmd="\$token"; dispatch_is_candidate=1; break;;
+  esac
+done
+# Host-only commands are explicitly namespaced; --profile belongs to OMP.
+if [[ "\${dispatch_args[0]:-}" == "\$host_cmd" ]]; then
+case "\$host_cmd" in
+  host-stop) sudo -n -u "\$AI_USER" "\$INNER" stop; sudo -n "\$SHARE_HELPER" cleanup-stale 0 >/dev/null 2>&1 || true; exit 0;;
+  host-status|host-stats|host-logs)
+    action="\${host_cmd#host-}"
+    shift
+    exec sudo -n -u "\$AI_USER" "\$INNER" "\$action" "\$@";;
+  host-config)
     shift
     case "\${1:-show}" in
       show|"") exec sudo -n -u "\$AI_USER" "\$INNER" config;;
       path) printf '%s\n' "\$RUNTIME_CONFIG"; exit 0;;
       edit) exec sudoedit "\$RUNTIME_CONFIG";;
-      *) echo "Usage: omp-ai config [show|path|edit]" >&2; exit 2;;
+      *) echo 'Usage: omp-ai host-config [show|path|edit]' >&2; exit 2;;
     esac;;
-  shell) sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$INNER" shell;;
-  reset-env) exec sudo -n -u "\$AI_USER" "\$INNER" reset-env;;
-  update) shift; (( \$# == 0 )) || { echo "Usage: omp-ai update" >&2; exit 2; }; sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
+  workbench-shell) sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$INNER" shell;;
+  host-reset-env) exec sudo -n -u "\$AI_USER" "\$INNER" reset-env;;
+  host-update) shift; (( \$# == 0 )) || { echo 'Usage: omp-ai host-update' >&2; exit 2; }; sudo -n "\$SHARE_HELPER" prepare >/dev/null; exec sudo -n -u "\$AI_USER" "\$UPDATE_HELPER";;
 esac
+fi
+# Check registered subcommands in the *installed* OMP. Never swallow an
+# infrastructure failure as "not registered" (which could run a host action).
+# launch/acp need the managed router/session lifecycle, so use that path.
+if (( dispatch_is_candidate && ! unknown_leading_option )) && [[ "\$host_cmd" != launch && "\$host_cmd" != acp && ( "\$host_cmd" == __complete || "\$host_cmd" =~ ^[a-z][a-z0-9-]*$ ) ]]; then
+  native_rc=0
+  sudo -n -u "\$AI_USER" "\$INNER" native-has "\$host_cmd" || native_rc=\$?
+  case "\$native_rc" in
+    0)
+      sudo -n "\$SHARE_HELPER" prepare >/dev/null
+      pwd_real="\$(realpath -m "\$PWD")"; rel=""
+      case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
+      exec sudo -n -u "\$AI_USER" "\$INNER" native-cli --workdir "\$rel" -- "\${dispatch_args[@]}";;
+    1) ;; # Not a registered OMP command; check host aliases below.
+    *) echo "[omp-ai] ERROR: cannot inspect installed OMP commands (rc=\$native_rc); refusing host fallback." >&2; exit 5;;
+  esac
+fi
+if [[ "\${dispatch_args[0]:-}" == "\$host_cmd" ]]; then
+case "\$host_cmd" in
+  stop|status|stats|logs|config|shell|update|reset-env)
+    case "\$host_cmd" in
+      stop) action=host-stop;; status) action=host-status;; stats) action=host-stats;; logs) action=host-logs;; config) action=host-config;; shell) action=workbench-shell;; update) action=host-update;; reset-env) action=host-reset-env;;
+    esac
+    exec "\$0" "\$action" "\${@:2}";;
+esac
+fi
+# Help/version are pure native OMP operations, including when scoped by a
+# leading --profile. They never need to spin up llama or a session.
+info_only=0; info_args_ok=1
+for (( info_i=0; info_i < \${#dispatch_args[@]}; info_i++ )); do
+  case "\${dispatch_args[info_i]}" in
+    --profile) (( ++info_i )); (( info_i < \${#dispatch_args[@]} )) || { info_args_ok=0; break; };;
+    --profile=*) ;;
+    --help|-h|--version|-v) info_only=1;;
+    *) info_args_ok=0; break;;
+  esac
+done
+if (( info_only && info_args_ok )); then
+  exec sudo -n -u "\$AI_USER" "\$INNER" native-cli -- "\${dispatch_args[@]}"
+fi
+# Managed launches receive the exact original OMP argv (including -c/-r,
+# profile flags and any future CLI options), without reinterpretation.
+set -- "\${dispatch_args[@]}"
 sudo -n "\$SHARE_HELPER" prepare >/dev/null
 pwd_real="\$(realpath -m "\$PWD")"; rel=""; case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
 modes=(); paths=(); omp_args=(); while (( \$# )); do case "\$1" in --share) modes+=(rw); paths+=("\${2:?}"); shift 2;; --share-ro) modes+=(ro); paths+=("\${2:?}"); shift 2;; --) shift; omp_args+=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
@@ -1453,7 +1814,17 @@ set +e; sudo -n -u "\$AI_USER" "\$INNER" --workdir "\$rel" "\${inner_shares[@]}"
 ( while kill -0 "\$child" 2>/dev/null; do sudo -n "\$SHARE_HELPER" heartbeat "\$sid" >/dev/null 2>&1 || exit 0; sleep 20; done ) & share_hb=\$!
 wait "\$child"; rc=\$?; child=""; set -e; exit "\$rc"
 EOT
-root chmod 0755 "$PUBLIC"
+# Same atomic/content-idempotent policy as the inner launcher. Never truncate
+# a public wrapper while another terminal may be starting a session.
+root chmod 0755 "$PUBLIC_TMP"
+root chown root:root "$PUBLIC_TMP"
+root bash -n "$PUBLIC_TMP"
+if root cmp -s -- "$PUBLIC_TMP" "$PUBLIC"; then
+  root rm -f -- "$PUBLIC_TMP"
+  log "Public omp-ai launcher unchanged; preserving inode and timestamps."
+else
+  root mv -f -- "$PUBLIC_TMP" "$PUBLIC"
+fi
 
 # ----- model manager -----
 MODEL_HELPER="/usr/local/libexec/omp-ai-model"
