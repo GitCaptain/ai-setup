@@ -57,11 +57,15 @@ AI_SLICE_CPU="2400%"
 EXA_API_KEY=""
 WEB_SEARCH_PRIMARY="auto"
 WEB_SEARCH_FALLBACK="duckduckgo"
-# Used only when *creating* cloud/local OMP named profiles. Existing files are kept.
+# Model choices for seeded cloud/local profiles. Existing user-edited files stay untouched.
 CLOUD_PRIMARY_MODEL="openai-codex/gpt-5.5:high"
 CLOUD_PLAN_MODEL="openai-codex/gpt-5.5:xhigh"
 CLOUD_FALLBACK_MODEL="deepseek/deepseek-v4-pro:xhigh"
 LOCAL_PRIMARY_MODEL="Qwen3.6-35B-A3B-Q4_K_M"
+# Model-specific 64K router preset (the generic router fallback stays at 32K).
+LOCAL_CTX_TOTAL=65536
+LOCAL_CACHE_TYPE_K="q8_0"
+LOCAL_CACHE_TYPE_V="q8_0"
 LOCAL_RARE_MODEL="Qwen3.8-27B-Q4_K_M"
 HARDEN_HOME="true"
 ASSUME_YES="false"
@@ -173,7 +177,9 @@ set_cfg(){
     AI_SLICE_MEM) AI_SLICE_MEM="$v";; AI_SLICE_CPU) AI_SLICE_CPU="$v";;
     EXA_API_KEY) EXA_API_KEY="$v";; WEB_SEARCH_PRIMARY) WEB_SEARCH_PRIMARY="$v";; WEB_SEARCH_FALLBACK) WEB_SEARCH_FALLBACK="$v";;
     CLOUD_PRIMARY_MODEL) CLOUD_PRIMARY_MODEL="$v";; CLOUD_PLAN_MODEL) CLOUD_PLAN_MODEL="$v";; CLOUD_FALLBACK_MODEL) CLOUD_FALLBACK_MODEL="$v";;
-    LOCAL_PRIMARY_MODEL) LOCAL_PRIMARY_MODEL="$v";; LOCAL_RARE_MODEL) LOCAL_RARE_MODEL="$v";;
+    LOCAL_PRIMARY_MODEL) LOCAL_PRIMARY_MODEL="$v";;
+    LOCAL_CTX_TOTAL) LOCAL_CTX_TOTAL="$v";; LOCAL_CACHE_TYPE_K) LOCAL_CACHE_TYPE_K="$v";; LOCAL_CACHE_TYPE_V) LOCAL_CACHE_TYPE_V="$v";;
+    LOCAL_RARE_MODEL) LOCAL_RARE_MODEL="$v";;
     HARDEN_HOME) HARDEN_HOME="$v";; ASSUME_YES) ASSUME_YES="$v";; "") ;;
     *) die "Unknown config key: $k";;
   esac
@@ -247,6 +253,11 @@ case "$LLAMA_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *
 case "$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid LLAMA_CACHE_TYPE_V";; esac
 [[ -n "$WORK_MODEL" && "$WORK_MODEL" != *']'* && "$WORK_MODEL" != *$'\n'* ]] || die "Invalid WORK_MODEL"
 [[ "$WORK_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( WORK_CTX_TOTAL >= 1024 )) || die "WORK_CTX_TOTAL must be >= 1024"
+[[ "$LOCAL_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LOCAL_CTX_TOTAL >= 1024 )) || die "LOCAL_CTX_TOTAL must be >= 1024"
+[[ "$LOCAL_CACHE_TYPE_K" =~ ^(f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$ ]] || die "Invalid LOCAL_CACHE_TYPE_K"
+[[ "$LOCAL_CACHE_TYPE_V" =~ ^(f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$ ]] || die "Invalid LOCAL_CACHE_TYPE_V"
+[[ "$LOCAL_PRIMARY_MODEL" != "$WORK_MODEL" && "$LOCAL_PRIMARY_MODEL" != "$SPEC_TARGET_MODEL" ]] || die "LOCAL_PRIMARY_MODEL must differ from WORK_MODEL and SPEC_TARGET_MODEL (distinct router presets)"
+[[ "$LOCAL_PRIMARY_MODEL" != *']'* && "$LOCAL_PRIMARY_MODEL" != *$'\n'* ]] || die "Invalid LOCAL_PRIMARY_MODEL"
 case "$WORK_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid WORK_CACHE_TYPE_K";; esac
 case "$WORK_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) die "Invalid WORK_CACHE_TYPE_V";; esac
 [[ "$SPEC_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( SPEC_CTX_TOTAL >= 1024 )) || die "SPEC_CTX_TOTAL must be >= 1024"
@@ -475,6 +486,9 @@ WORK_MODEL=$WORK_MODEL
 WORK_CTX_TOTAL=$WORK_CTX_TOTAL
 WORK_CACHE_TYPE_K=$WORK_CACHE_TYPE_K
 WORK_CACHE_TYPE_V=$WORK_CACHE_TYPE_V
+LOCAL_CTX_TOTAL=$LOCAL_CTX_TOTAL
+LOCAL_CACHE_TYPE_K=$LOCAL_CACHE_TYPE_K
+LOCAL_CACHE_TYPE_V=$LOCAL_CACHE_TYPE_V
 SPEC_MODE=$SPEC_MODE
 SPEC_TARGET_MODEL=$SPEC_TARGET_MODEL
 SPEC_CTX_TOTAL=$SPEC_CTX_TOTAL
@@ -490,7 +504,7 @@ LLAMA_MEM=$LLAMA_MEM
 EOT
 else
   log "Preserving live llama runtime config: $RUNTIME_CONFIG"
-  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V WORK_MODEL WORK_CTX_TOTAL WORK_CACHE_TYPE_K WORK_CACHE_TYPE_V SPEC_MODE SPEC_TARGET_MODEL SPEC_CTX_TOTAL SPEC_CACHE_TYPE_K SPEC_CACHE_TYPE_V SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
+  for key in LLAMA_CTX_TOTAL LLAMA_PARALLEL VRAM_RESERVE_MIB LLAMA_LOG_VERBOSITY LLAMA_CACHE_RAM_MIB LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V WORK_MODEL WORK_CTX_TOTAL WORK_CACHE_TYPE_K WORK_CACHE_TYPE_V LOCAL_CTX_TOTAL LOCAL_CACHE_TYPE_K LOCAL_CACHE_TYPE_V SPEC_MODE SPEC_TARGET_MODEL SPEC_CTX_TOTAL SPEC_CACHE_TYPE_K SPEC_CACHE_TYPE_V SPEC_DRAFT_FILE SPEC_DRAFT_N_MAX SPEC_DRAFT_P_MIN SPEC_DRAFT_NGL SPEC_DRAFT_CACHE_TYPE MODELS_MAX LLAMA_MEM; do
     if ! root grep -qE "^${key}=" "$RUNTIME_CONFIG"; then
       printf '%s=%s\n' "$key" "${!key}" | root tee -a "$RUNTIME_CONFIG" >/dev/null
     fi
@@ -677,10 +691,12 @@ root mount --make-rshared "$SHARE_STAGE"
 # only missing files and do not touch the original default profile or existing
 # named-profile sessions, auth stores, agents, or user modifications.
 log "Seeding cloud/local OMP named profiles (only missing files)..."
-root python3 - "$AI_HOME/state/.omp" "$AI_UID" "$AI_GID" "$CLOUD_PRIMARY_MODEL" "$CLOUD_PLAN_MODEL" "$CLOUD_FALLBACK_MODEL" "$LOCAL_PRIMARY_MODEL" "$LOCAL_RARE_MODEL" <<'PYPROFILES'
+root python3 - "$AI_HOME/state/.omp" "$AI_UID" "$AI_GID" "$CLOUD_PRIMARY_MODEL" "$CLOUD_PLAN_MODEL" "$CLOUD_FALLBACK_MODEL" "$LOCAL_PRIMARY_MODEL" "$LOCAL_RARE_MODEL" "$LOCAL_CTX_TOTAL" "$AI_HOME/backup" <<'PYPROFILES'
 import os, pathlib, sys, tempfile
 base = pathlib.Path(sys.argv[1]); uid, gid = map(int,sys.argv[2:4])
-cloud_default, cloud_plan, deepseek, local_main, local_rare = sys.argv[4:]
+cloud_default, cloud_plan, deepseek, local_main, local_rare, local_ctx_raw, backup_raw = sys.argv[4:]
+local_ctx = int(local_ctx_raw)
+backup_dir = pathlib.Path(backup_raw)
 for selector in (cloud_default, cloud_plan, deepseek, local_main, local_rare):
     if not selector or any(c in selector for c in '\n\r\t"\\'):
         raise SystemExit('Unsafe or empty model selector in cloud/local profile config')
@@ -710,8 +726,8 @@ def newfile(path, content):
         try: os.unlink(tmp)
         except FileNotFoundError: pass
 
-def model_yaml(include_deepseek):
-    source = '''providers:
+def model_yaml(include_deepseek, ctx=local_ctx):
+    source = f'''providers:
   llama.cpp:
     baseUrl: http://llama:8080
     auth: none
@@ -720,8 +736,8 @@ def model_yaml(include_deepseek):
       type: llama.cpp
     modelOverrides:
       Qwen3.6-35B-A3B-Q4_K_M:
-        contextWindow: 32768
-        maxContextWindow: 32768
+        contextWindow: {ctx}
+        maxContextWindow: {ctx}
       Qwen3.8-27B-Q4_K_M:
         contextWindow: 32768
         maxContextWindow: 32768
@@ -898,13 +914,67 @@ for name, cfg, ds in [('local', local, False),('cloud',cloud,True)]:
     mkdir(root)
     newfile(root/'config.yml',cfg)
     newfile(root/'models.yml',model_yaml(ds))
+    # Upgrade only the exact file the previous installer generated (32K),
+    # for both profiles: cloud's local-coder must also see the full 64K.
+    # Take a no-clobber backup first and never rewrite user-edited YAML.
+    model_path = root/'models.yml'
+    original = model_path.read_text(encoding='utf-8')
+    if original == model_yaml(ds, 32768) and local_ctx != 32768:
+        if not backup_dir.is_dir() or backup_dir.is_symlink():
+            raise SystemExit('Cannot snapshot existing profile models.yml: invalid backup directory')
+        backup_path = backup_dir/f'profiles-{name}-models.before-64k.yml'
+        if not backup_path.exists():
+            newfile(backup_path, original)
+        new_text = model_yaml(ds, local_ctx)
+        fd, temp_path = tempfile.mkstemp(prefix='.models.yml.',dir=root)
+        try:
+            os.fchmod(fd,0o600); os.fchown(fd,uid,gid)
+            with os.fdopen(fd,'w',encoding='utf-8') as out:
+                out.write(new_text)
+            if model_path.read_text(encoding='utf-8') != original:
+                raise SystemExit(f'{name}/models.yml changed concurrently; refusing upgrade')
+            os.replace(temp_path, model_path)
+        finally:
+            try: os.unlink(temp_path)
+            except FileNotFoundError: pass
+        print(f'[omp-ai] Upgraded untouched {name}/models.yml Qwen3.6 context 32K -> {local_ctx}; saved original in backup/')
+    elif original != model_yaml(ds, local_ctx):
+        print(f'[omp-ai] WARNING: {name}/models.yml is customized; preserving it unchanged. Verify Qwen3.6 contextWindow/maxContextWindow are {local_ctx}.')
+
+    # Use OMP's native streaming token_rate segment, not polling or an extension.
+    # If a profile config is user-edited, do not change it automatically.
+    cfg_path = root/'config.yml'
+    existing_config = cfg_path.read_text(encoding='utf-8')
+    import re
+    if re.search(r'^statusLine\s*:', existing_config, re.MULTILINE):
+        print(f'[omp-ai] Preserving existing statusLine settings in {name}.')
+    elif existing_config != cfg:
+        print(f'[omp-ai] WARNING: {name}/config.yml is customized; preserving it unchanged. To show speed, add token_rate to statusLine.leftSegments.')
+    else:
+        if not backup_dir.is_dir() or backup_dir.is_symlink():
+            raise SystemExit('Cannot snapshot existing profile config.yml: invalid backup directory')
+        backup_path = backup_dir/f'profiles-{name}-config.before-token-rate.yml'
+        if not backup_path.exists():
+            newfile(backup_path, existing_config)
+        status_section = ('''
+statusLine:
+  preset: custom
+  separator: powerline-thin
+  leftSegments: [pi, vim, model, token_rate, mode, path, git, context_pct]
+  rightSegments: [session_name]
+''')
+        if cfg_path.read_text(encoding='utf-8') != existing_config:
+            raise SystemExit(f'{name}/config.yml changed concurrently; refusing update')
+        with cfg_path.open('a',encoding='utf-8') as out:
+            out.write(status_section)
+        print(f'[omp-ai] Enabled native OMP token_rate status segment for {name}.')
     if name=='cloud':
         newfile(root/'agents'/'local-coder.md',agent)
         newfile(root/'APPEND_SYSTEM.md',policy)
     else:
         newfile(root/'agents'/'rare-planner.md',rare_agent)
         newfile(root/'APPEND_SYSTEM.md',rare_policy)
-print('[omp-ai] Profiles initialized/preserved: local, cloud; default untouched.')
+print('[omp-ai] Profiles initialized/preserved: local, cloud; original unnamed profile untouched (wrapper alias: legacy-archived).')
 PYPROFILES
 
 # ----- OMP updater -----
@@ -1204,7 +1274,7 @@ INNER_TMP="$(root mktemp /usr/local/libexec/.omp-ai-inner.XXXXXXXX)"
 root tee "$INNER_TMP" >/dev/null <<EOT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; WEB_SEARCH_PRIMARY="$WEB_SEARCH_PRIMARY"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
+AI_HOME="$AI_HOME"; WORKBENCH_BASE_IMAGE="$WORKBENCH_BASE_IMAGE"; WORKSPACE="$WORKSPACE"; MODEL_STORE="$MODEL_STORE"; DRAFT_STORE="$DRAFT_STORE"; LLAMA_IMAGE="$LLAMA_IMAGE"; LLAMA_PORT="$LLAMA_PORT"; LLAMA_CTX_TOTAL="$LLAMA_CTX_TOTAL"; LLAMA_PARALLEL="$LLAMA_PARALLEL"; LLAMA_MEM="$LLAMA_MEM"; OMP_MEM="$OMP_MEM"; VRAM_RESERVE_MIB="$VRAM_RESERVE_MIB"; LLAMA_LOG_VERBOSITY="$LLAMA_LOG_VERBOSITY"; MODELS_MAX="$MODELS_MAX"; LLAMA_CACHE_RAM_MIB="$LLAMA_CACHE_RAM_MIB"; LLAMA_CACHE_TYPE_K="$LLAMA_CACHE_TYPE_K"; LLAMA_CACHE_TYPE_V="$LLAMA_CACHE_TYPE_V"; WORK_MODEL="$WORK_MODEL"; WORK_CTX_TOTAL="$WORK_CTX_TOTAL"; WORK_CACHE_TYPE_K="$WORK_CACHE_TYPE_K"; WORK_CACHE_TYPE_V="$WORK_CACHE_TYPE_V"; LOCAL_PRIMARY_MODEL="$LOCAL_PRIMARY_MODEL"; LOCAL_CTX_TOTAL="$LOCAL_CTX_TOTAL"; LOCAL_CACHE_TYPE_K="$LOCAL_CACHE_TYPE_K"; LOCAL_CACHE_TYPE_V="$LOCAL_CACHE_TYPE_V"; SPEC_MODE="$SPEC_MODE"; SPEC_TARGET_MODEL="$SPEC_TARGET_MODEL"; SPEC_CTX_TOTAL="$SPEC_CTX_TOTAL"; SPEC_CACHE_TYPE_K="$SPEC_CACHE_TYPE_K"; SPEC_CACHE_TYPE_V="$SPEC_CACHE_TYPE_V"; SPEC_DRAFT_FILE="$SPEC_DRAFT_FILE"; SPEC_DRAFT_N_MAX="$SPEC_DRAFT_N_MAX"; SPEC_DRAFT_P_MIN="$SPEC_DRAFT_P_MIN"; SPEC_DRAFT_NGL="$SPEC_DRAFT_NGL"; SPEC_DRAFT_CACHE_TYPE="$SPEC_DRAFT_CACHE_TYPE"; WEB_SEARCH_PRIMARY="$WEB_SEARCH_PRIMARY"; AI_UID="$AI_UID"; SECRET_ENV="$SECRET_ENV"; SHARE_STAGE="$SHARE_STAGE"; RUNTIME_CONFIG="$RUNTIME_CONFIG"
 export HOME="\$AI_HOME" XDG_RUNTIME_DIR="/run/user/\$AI_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$AI_UID/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin" TERM="\${TERM:-xterm-256color}"
 cd "\$AI_HOME"
 load_runtime_config(){
@@ -1232,6 +1302,9 @@ load_runtime_config(){
       WORK_CTX_TOTAL) WORK_CTX_TOTAL="\$value";;
       WORK_CACHE_TYPE_K) WORK_CACHE_TYPE_K="\$value";;
       WORK_CACHE_TYPE_V) WORK_CACHE_TYPE_V="\$value";;
+      LOCAL_CTX_TOTAL) LOCAL_CTX_TOTAL="\$value";;
+      LOCAL_CACHE_TYPE_K) LOCAL_CACHE_TYPE_K="\$value";;
+      LOCAL_CACHE_TYPE_V) LOCAL_CACHE_TYPE_V="\$value";;
       SPEC_CTX_TOTAL) SPEC_CTX_TOTAL="\$value";;
       SPEC_CACHE_TYPE_K) SPEC_CACHE_TYPE_K="\$value";;
       SPEC_CACHE_TYPE_V) SPEC_CACHE_TYPE_V="\$value";;
@@ -1263,6 +1336,9 @@ load_runtime_config(){
   case "\$LLAMA_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid LLAMA_CACHE_TYPE_V" >&2; return 2;; esac
   [[ -n "\$WORK_MODEL" && "\$WORK_MODEL" != *']'* && "\$WORK_MODEL" != *$'\\n'* ]] || { echo "[omp-ai] ERROR: invalid WORK_MODEL" >&2; return 2; }
   [[ "\$WORK_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( WORK_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: WORK_CTX_TOTAL must be >= 1024" >&2; return 2; }
+  [[ "\$LOCAL_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( LOCAL_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: LOCAL_CTX_TOTAL must be >= 1024" >&2; return 2; }
+  [[ "\$LOCAL_CACHE_TYPE_K" =~ ^(f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$ ]] || { echo "[omp-ai] ERROR: invalid LOCAL_CACHE_TYPE_K" >&2; return 2; }
+  [[ "\$LOCAL_CACHE_TYPE_V" =~ ^(f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$ ]] || { echo "[omp-ai] ERROR: invalid LOCAL_CACHE_TYPE_V" >&2; return 2; }
   case "\$WORK_CACHE_TYPE_K" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid WORK_CACHE_TYPE_K" >&2; return 2;; esac
   case "\$WORK_CACHE_TYPE_V" in f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;; *) echo "[omp-ai] ERROR: invalid WORK_CACHE_TYPE_V" >&2; return 2;; esac
   [[ "\$SPEC_CTX_TOTAL" =~ ^[0-9]+$ ]] && (( SPEC_CTX_TOTAL >= 1024 )) || { echo "[omp-ai] ERROR: SPEC_CTX_TOTAL must be >= 1024" >&2; return 2; }
@@ -1380,6 +1456,16 @@ cache-type-k = \$WORK_CACHE_TYPE_K
 cache-type-v = \$WORK_CACHE_TYPE_V
 EOP
   fi
+
+  # Default local profile's 35B MoE needs a dedicated 64K/Q8 profile. It
+  # must not inherit the generic 32K/f16 fallback from the [*] stanza.
+  cat >>"\$preset" <<EOP
+
+[\$LOCAL_PRIMARY_MODEL]
+ctx-size = \$LOCAL_CTX_TOTAL
+cache-type-k = \$LOCAL_CACHE_TYPE_K
+cache-type-v = \$LOCAL_CACHE_TYPE_V
+EOP
 
   # The slow target always gets its own context/KV profile, even when speculation is disabled.
   cat >>"\$preset" <<EOP
@@ -1550,8 +1636,8 @@ esac
 case "\${1:-}" in
   config)
     echo "Runtime config: \$RUNTIME_CONFIG"
-    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nWORK_MODEL=%s\nWORK_CTX_TOTAL=%s\nWORK_CACHE_TYPE_K=%s\nWORK_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_CTX_TOTAL=%s\nSPEC_CACHE_TYPE_K=%s\nSPEC_CACHE_TYPE_V=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
-      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$LLAMA_CACHE_TYPE_K" "\$LLAMA_CACHE_TYPE_V" "\$WORK_MODEL" "\$WORK_CTX_TOTAL" "\$WORK_CACHE_TYPE_K" "\$WORK_CACHE_TYPE_V" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_CTX_TOTAL" "\$SPEC_CACHE_TYPE_K" "\$SPEC_CACHE_TYPE_V" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
+    printf 'LLAMA_CTX_TOTAL=%s\nLLAMA_PARALLEL=%s\nVRAM_RESERVE_MIB=%s\nLLAMA_LOG_VERBOSITY=%s\nLLAMA_CACHE_RAM_MIB=%s\nLLAMA_CACHE_TYPE_K=%s\nLLAMA_CACHE_TYPE_V=%s\nWORK_MODEL=%s\nWORK_CTX_TOTAL=%s\nWORK_CACHE_TYPE_K=%s\nWORK_CACHE_TYPE_V=%s\nLOCAL_CTX_TOTAL=%s\nLOCAL_CACHE_TYPE_K=%s\nLOCAL_CACHE_TYPE_V=%s\nSPEC_MODE=%s\nSPEC_TARGET_MODEL=%s\nSPEC_CTX_TOTAL=%s\nSPEC_CACHE_TYPE_K=%s\nSPEC_CACHE_TYPE_V=%s\nSPEC_DRAFT_FILE=%s\nSPEC_DRAFT_N_MAX=%s\nSPEC_DRAFT_P_MIN=%s\nSPEC_DRAFT_NGL=%s\nSPEC_DRAFT_CACHE_TYPE=%s\nMODELS_MAX=%s\nLLAMA_MEM=%s\n' \
+      "\$LLAMA_CTX_TOTAL" "\$LLAMA_PARALLEL" "\$VRAM_RESERVE_MIB" "\$LLAMA_LOG_VERBOSITY" "\$LLAMA_CACHE_RAM_MIB" "\$LLAMA_CACHE_TYPE_K" "\$LLAMA_CACHE_TYPE_V" "\$WORK_MODEL" "\$WORK_CTX_TOTAL" "\$WORK_CACHE_TYPE_K" "\$WORK_CACHE_TYPE_V" "\$LOCAL_CTX_TOTAL" "\$LOCAL_CACHE_TYPE_K" "\$LOCAL_CACHE_TYPE_V" "\$SPEC_MODE" "\$SPEC_TARGET_MODEL" "\$SPEC_CTX_TOTAL" "\$SPEC_CACHE_TYPE_K" "\$SPEC_CACHE_TYPE_V" "\$SPEC_DRAFT_FILE" "\$SPEC_DRAFT_N_MAX" "\$SPEC_DRAFT_P_MIN" "\$SPEC_DRAFT_NGL" "\$SPEC_DRAFT_CACHE_TYPE" "\$MODELS_MAX" "\$LLAMA_MEM"
     exit 0;;
   stop)
     # stop is an operator command and must never hang forever behind a stale
@@ -1716,7 +1802,47 @@ INNER="$INNER"; SHARE_HELPER="$SHARE_HELPER"; UPDATE_HELPER="$OMP_UPDATE_HELPER"
 # Parse *only* enough leading options to locate the first positional command;
 # keep the ORIGINAL argv intact for native and managed execution.
 # Unknown future OMP options are passed to the managed OMP launcher as-is.
+# /run is tmpfs: after a reboot the stage from the existing persistent
+# workbench's bind-mount config may not exist. Prepare it BEFORE any
+# native-has/native-cli/--help path starts (or inspects) that container.
+# This is mount-only and never changes the workbench rootfs, OMP state,
+# sessions, Android container, or user package installations.
+if ! sudo -n "\$SHARE_HELPER" prepare; then
+  echo '[omp-ai] ERROR: cannot prepare /run/omp-ai-shares before starting the persistent workbench.' >&2
+  echo '[omp-ai] Inspect: sudo /usr/local/libexec/omp-ai-share prepare' >&2
+  exit 3
+fi
 dispatch_args=("\$@")
+# Only argv sent to OMP is rewritten. Host commands are detected against the
+# original tokens, so e.g. omp-ai host-stats still works unchanged.
+# "legacy-archived" is a virtual omp-ai alias for ~/.omp/agent; there is no
+# physical named profile to seed, move, or duplicate.
+forward_args=()
+explicit_profile=0
+for (( p_i=0; p_i < \${#dispatch_args[@]}; p_i++ )); do
+  p_token="\${dispatch_args[p_i]}"
+  if [[ "\$p_token" == -- ]]; then
+    forward_args+=("\${dispatch_args[@]:p_i}")
+    break
+  fi
+  case "\$p_token" in
+    --profile)
+      (( explicit_profile += 1 ))
+      (( p_i + 1 < \${#dispatch_args[@]} )) || { echo '[omp-ai] ERROR: --profile requires a name.' >&2; exit 2; }
+      p_value="\${dispatch_args[p_i+1]}"
+      [[ -n "\$p_value" && "\$p_value" != -* ]] || { echo '[omp-ai] ERROR: invalid --profile value.' >&2; exit 2; }
+      if [[ "\$p_value" != legacy-archived ]]; then forward_args+=(--profile "\$p_value"); fi
+      (( ++p_i ));;
+    --profile=*)
+      (( explicit_profile += 1 ))
+      p_value="\${p_token#--profile=}"
+      [[ -n "\$p_value" ]] || { echo '[omp-ai] ERROR: empty --profile value.' >&2; exit 2; }
+      if [[ "\$p_value" != legacy-archived ]]; then forward_args+=("\$p_token"); fi;;
+    *) forward_args+=("\$p_token");;
+  esac
+done
+(( explicit_profile <= 1 )) || { echo '[omp-ai] ERROR: duplicate --profile selectors are ambiguous.' >&2; exit 2; }
+if (( explicit_profile == 0 )); then forward_args=(--profile local "\${forward_args[@]}"); fi
 # Work from the original CLI tokens, so --profile is valid before or after
 # other launch flags and native commands can follow launch flags.
 scan=("\${dispatch_args[@]}")
@@ -1772,7 +1898,7 @@ if (( dispatch_is_candidate && ! unknown_leading_option )) && [[ "\$host_cmd" !=
       sudo -n "\$SHARE_HELPER" prepare >/dev/null
       pwd_real="\$(realpath -m "\$PWD")"; rel=""
       case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
-      exec sudo -n -u "\$AI_USER" "\$INNER" native-cli --workdir "\$rel" -- "\${dispatch_args[@]}";;
+      exec sudo -n -u "\$AI_USER" "\$INNER" native-cli --workdir "\$rel" -- "\${forward_args[@]}";;
     1) ;; # Not a registered OMP command; check host aliases below.
     *) echo "[omp-ai] ERROR: cannot inspect installed OMP commands (rc=\$native_rc); refusing host fallback." >&2; exit 5;;
   esac
@@ -1798,11 +1924,12 @@ for (( info_i=0; info_i < \${#dispatch_args[@]}; info_i++ )); do
   esac
 done
 if (( info_only && info_args_ok )); then
-  exec sudo -n -u "\$AI_USER" "\$INNER" native-cli -- "\${dispatch_args[@]}"
+  exec sudo -n -u "\$AI_USER" "\$INNER" native-cli -- "\${forward_args[@]}"
 fi
-# Managed launches receive the exact original OMP argv (including -c/-r,
-# profile flags and any future CLI options), without reinterpretation.
-set -- "\${dispatch_args[@]}"
+# Managed launches preserve native OMP options and payload unchanged, except
+# adding --profile local when absent or resolving --profile legacy-archived.
+# -c/-r and all other OMP flags still pass through.
+set -- "\${forward_args[@]}"
 sudo -n "\$SHARE_HELPER" prepare >/dev/null
 pwd_real="\$(realpath -m "\$PWD")"; rel=""; case "\$pwd_real" in "\$WORKSPACE") rel="";; "\$WORKSPACE"/*) rel="\${pwd_real#"\$WORKSPACE/"}";; esac
 modes=(); paths=(); omp_args=(); while (( \$# )); do case "\$1" in --share) modes+=(rw); paths+=("\${2:?}"); shift 2;; --share-ro) modes+=(ro); paths+=("\${2:?}"); shift 2;; --) shift; omp_args+=("\$@"); break;; *) omp_args+=("\$1"); shift;; esac; done
