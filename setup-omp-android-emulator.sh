@@ -13,6 +13,7 @@ ANDROID_GUEST_RAM_MB="${ANDROID_GUEST_RAM_MB:-2048}"
 ANDROID_CONTAINER_MEM="${ANDROID_CONTAINER_MEM:-4g}"
 ANDROID_CPUS="${ANDROID_CPUS:-4}"
 ANDROID_INTERNET="${ANDROID_INTERNET:-1}"
+ANDROID_BOOT_TIMEOUT="${ANDROID_BOOT_TIMEOUT:-120}"
 
 ANDROID_NET="${ANDROID_NET:-omp-android}"
 WEB_NET="${WEB_NET:-omp-web}"
@@ -40,6 +41,9 @@ done
 
 id "$AI_USER" >/dev/null 2>&1 || die "host user '$AI_USER' does not exist; install omp-ai first"
 [[ -e /dev/kvm ]] || die "/dev/kvm does not exist. Enable SVM/virtualization in BIOS and load KVM first."
+
+[[ "$ANDROID_BOOT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "ANDROID_BOOT_TIMEOUT must be a positive integer (seconds)"
+[[ "$ANDROID_INTERNET" == "0" || "$ANDROID_INTERNET" == "1" ]] || die "ANDROID_INTERNET must be 0 or 1"
 
 log "Authorizing sudo..."
 sudo -v
@@ -74,6 +78,10 @@ sudo install -d -o "$AI_USER" -g "$AI_USER" -m 0700 "$ANDROID_ROOT" "$ANDROID_AV
 log "Ensuring isolated Android network..."
 if ! as_ai podman network exists "$ANDROID_NET" 2>/dev/null; then
   as_ai podman network create --internal "$ANDROID_NET" >/dev/null
+fi
+if [[ "$ANDROID_INTERNET" == "1" ]]; then
+  as_ai podman network exists "$WEB_NET" >/dev/null 2>&1 ||
+    die "network $WEB_NET does not exist; refusing to replace existing Android container"
 fi
 
 if as_ai podman container exists "$WORKBENCH" 2>/dev/null; then
@@ -172,6 +180,7 @@ trap cleanup EXIT INT TERM
 exec emulator \
   -avd "$ANDROID_AVD_NAME" \
   -port 5554 \
+  -no-snapshot \
   -no-window \
   -no-audio \
   -no-boot-anim \
@@ -180,48 +189,84 @@ exec emulator \
   -memory "$ANDROID_GUEST_RAM_MB"
 ENTRYPOINT
 
-log "Building $EMU_IMAGE (first build downloads Android SDK + system image)..."
-as_ai podman build \
-  --build-arg "CMDLINE_TOOLS_REV=$CMDLINE_TOOLS_REV" \
-  --build-arg "CMDLINE_TOOLS_SHA256=$CMDLINE_TOOLS_SHA256" \
-  --build-arg "ANDROID_API=$ANDROID_API" \
-  --build-arg "ANDROID_IMAGE_FLAVOR=$ANDROID_IMAGE_FLAVOR" \
-  --build-arg "ANDROID_ARCH=$ANDROID_ARCH" \
-  -t "$EMU_IMAGE" \
-  -f "$BUILD_DIR/Containerfile" \
-  "$BUILD_DIR"
+# Label the managed sidecar with a fingerprint so repeat setup does not rebuild
+# or recreate an otherwise healthy persistent Android container.
+SETUP_FINGERPRINT="$(
+  {
+    as_ai sha256sum "$BUILD_DIR/Containerfile" "$BUILD_DIR/entrypoint.sh"
+    printf '%s\n' \
+      "$CMDLINE_TOOLS_REV" "$CMDLINE_TOOLS_SHA256" \
+      "$ANDROID_API" "$ANDROID_IMAGE_FLAVOR" "$ANDROID_ARCH" "$ANDROID_AVD_NAME" \
+      "$ANDROID_GUEST_RAM_MB" "$ANDROID_CONTAINER_MEM" "$ANDROID_CPUS" \
+      "$ANDROID_INTERNET" "$ANDROID_NET" "$WEB_NET" \
+      "$ANDROID_AVD_DIR" "$EMU_IMAGE"
+  } | sha256sum | awk '{print $1}'
+)"
 
-log "Recreating emulator sidecar (AVD data is preserved)..."
-as_ai podman rm -f -t 3 "$EMU_CONTAINER" >/dev/null 2>&1 || true
+RECREATE_EMULATOR=1
+if as_ai podman container exists "$EMU_CONTAINER" 2>/dev/null; then
+  EXISTING_FINGERPRINT="$(as_ai podman inspect -f '{{index .Config.Labels "io.omp-ai.android.setup-sha256"}}' "$EMU_CONTAINER" 2>/dev/null || true)"
+  if [[ "$EXISTING_FINGERPRINT" == "$SETUP_FINGERPRINT" ]]; then
+    RECREATE_EMULATOR=0
+    log "Android sidecar already matches the current setup; preserving existing container and AVD."
+  fi
+fi
 
-as_ai podman create \
-  --name "$EMU_CONTAINER" \
-  --network "$ANDROID_NET" \
-  --device /dev/kvm:/dev/kvm:rwm \
-  --group-add keep-groups \
-  --memory "$ANDROID_CONTAINER_MEM" \
-  --cpus "$ANDROID_CPUS" \
-  --pids-limit 1024 \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --read-only \
-  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
-  --shm-size 1g \
-  --mount "type=bind,src=$ANDROID_AVD_DIR,dst=/android-home,bind-nonrecursive" \
-  -e "ANDROID_API=$ANDROID_API" \
-  -e "ANDROID_IMAGE_FLAVOR=$ANDROID_IMAGE_FLAVOR" \
-  -e "ANDROID_ARCH=$ANDROID_ARCH" \
-  -e "ANDROID_AVD_NAME=$ANDROID_AVD_NAME" \
-  -e "ANDROID_GUEST_RAM_MB=$ANDROID_GUEST_RAM_MB" \
-  "$EMU_IMAGE" >/dev/null
+if (( RECREATE_EMULATOR )); then
+  # Build before touching the running container. No AVD files are modified.
+  log "Building $EMU_IMAGE (first build downloads Android SDK + system image)..."
+  as_ai podman build \
+    --build-arg "CMDLINE_TOOLS_REV=$CMDLINE_TOOLS_REV" \
+    --build-arg "CMDLINE_TOOLS_SHA256=$CMDLINE_TOOLS_SHA256" \
+    --build-arg "ANDROID_API=$ANDROID_API" \
+    --build-arg "ANDROID_IMAGE_FLAVOR=$ANDROID_IMAGE_FLAVOR" \
+    --build-arg "ANDROID_ARCH=$ANDROID_ARCH" \
+    -t "$EMU_IMAGE" \
+    -f "$BUILD_DIR/Containerfile" \
+    "$BUILD_DIR"
 
-if [[ "$ANDROID_INTERNET" == "1" ]]; then
-  log "Giving emulator outbound internet via existing $WEB_NET network..."
-  as_ai podman network exists "$WEB_NET" >/dev/null 2>&1 ||
-    die "network $WEB_NET does not exist; run main omp-ai setup first"
-  as_ai podman network connect "$WEB_NET" "$EMU_CONTAINER"
-else
-  log "Emulator internet disabled; it will remain only on $ANDROID_NET."
+  if as_ai podman container exists "$EMU_CONTAINER" 2>/dev/null; then
+    log "Updating emulator sidecar; stopping the previous process gracefully (60s)..."
+    EXISTING_RUNNING="$(as_ai podman inspect -f '{{.State.Running}}' "$EMU_CONTAINER")"
+    if [[ "$EXISTING_RUNNING" == "true" ]]; then
+      as_ai podman stop -t 60 "$EMU_CONTAINER" >/dev/null || die "could not stop $EMU_CONTAINER safely; leaving it intact"
+    fi
+    [[ "$(as_ai podman inspect -f '{{.State.Running}}' "$EMU_CONTAINER")" == "false" ]] || \
+      die "$EMU_CONTAINER is still running; refusing to remove it"
+    as_ai podman rm "$EMU_CONTAINER" >/dev/null || die "could not remove the stopped sidecar"
+  fi
+
+  log "Creating emulator sidecar (persistent AVD data remains untouched)..."
+  as_ai podman create \
+    --name "$EMU_CONTAINER" \
+    --label "io.omp-ai.android.setup-sha256=$SETUP_FINGERPRINT" \
+    --network "$ANDROID_NET" \
+    --device /dev/kvm:/dev/kvm:rwm \
+    --group-add keep-groups \
+    --memory "$ANDROID_CONTAINER_MEM" \
+    --cpus "$ANDROID_CPUS" \
+    --pids-limit 1024 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    --shm-size 1g \
+    --mount "type=bind,src=$ANDROID_AVD_DIR,dst=/android-home,bind-nonrecursive" \
+    -e "ANDROID_API=$ANDROID_API" \
+    -e "ANDROID_IMAGE_FLAVOR=$ANDROID_IMAGE_FLAVOR" \
+    -e "ANDROID_ARCH=$ANDROID_ARCH" \
+    -e "ANDROID_AVD_NAME=$ANDROID_AVD_NAME" \
+    -e "ANDROID_GUEST_RAM_MB=$ANDROID_GUEST_RAM_MB" \
+    "$EMU_IMAGE" >/dev/null
+
+  if [[ "$ANDROID_INTERNET" == "1" ]]; then
+    log "Giving emulator outbound internet via existing $WEB_NET network..."
+    as_ai podman network exists "$WEB_NET" >/dev/null 2>&1 || \
+      die "network $WEB_NET does not exist; run main omp-ai setup first"
+    as_ai podman network connect "$WEB_NET" "$EMU_CONTAINER"
+  else
+    log "Emulator internet disabled; it will remain only on $ANDROID_NET."
+  fi
 fi
 
 log "Installing /usr/local/bin/omp-android helper..."
@@ -234,6 +279,8 @@ AI_HOME="$AI_HOME"
 AI_UID="$AI_UID"
 CONTAINER="$EMU_CONTAINER"
 AVD_DIR="$ANDROID_AVD_DIR"
+AVD_NAME="$ANDROID_AVD_NAME"
+BOOT_TIMEOUT="$ANDROID_BOOT_TIMEOUT"
 
 pctl() {
   sudo -u "\$AI_USER" \
@@ -243,16 +290,94 @@ pctl() {
     bash -c 'cd "\$HOME" && exec podman "\$@"' _ "\$@"
 }
 
+running() {
+  [[ "\$(pctl inspect -f '{{.State.Running}}' "\$CONTAINER")" == "true" ]]
+}
+
+ready() {
+  # Test guest readiness, not merely the socat listener / Podman running state.
+  pctl exec "\$CONTAINER" timeout 5 adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null \
+    | tr -d '\\r' | grep -qx '1'
+}
+
+wait_for_boot() {
+  local deadline=\$((SECONDS + BOOT_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    if ! running; then
+      echo "[omp-android] emulator exited during startup; last logs:" >&2
+      pctl logs --tail 35 "\$CONTAINER" >&2 || true
+      return 1
+    fi
+    if ready; then
+      echo "[omp-android] Android boot completed; adb inside workbench:" 
+      echo "  adb connect ompai-android:15555"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "[omp-android] startup timed out after \${BOOT_TIMEOUT}s; diagnostics:" >&2
+  pctl logs --tail 35 "\$CONTAINER" >&2 || true
+  echo "[omp-android] Container may still be running. Check: omp-android status" >&2
+  return 1
+}
+
+ensure_stopped() {
+  local state
+  state="\$(pctl inspect -f '{{.State.Running}}' "\$CONTAINER")" || {
+    echo "[omp-android] Cannot inspect the container; refusing to touch AVD data." >&2
+    return 1
+  }
+  if [[ "\$state" != "false" ]]; then
+    echo "[omp-android] Stop the emulator first: omp-android stop" >&2
+    return 1
+  fi
+}
+
+recover_locks() {
+  # Explicit, conservative recovery only. Never delete locks automatically.
+  ensure_stopped || return 1
+  if ps -u "\$AI_USER" -o args= | grep -Eq '[q]emu-system|[/]emulator.*-avd'; then
+    echo "[omp-android] Emulator/QEMU processes are still running; not touching locks." >&2
+    return 1
+  fi
+  local avd="\$AVD_DIR/.android/avd/\$AVD_NAME.avd"
+  sudo -u "\$AI_USER" test -d "\$avd" || {
+    echo "[omp-android] AVD directory missing: \$avd" >&2
+    return 1
+  }
+  local backup=""
+  local name
+  for name in snapshot.lock.lock hardware-qemu.ini.lock multiinstance.lock; do
+    if sudo -u "\$AI_USER" test -e "\$avd/\$name" || sudo -u "\$AI_USER" test -L "\$avd/\$name"; then
+      if [[ -z "\$backup" ]]; then
+        backup="\$(sudo -u "\$AI_USER" mktemp -d "\$AVD_DIR/lock-recovery-XXXXXXXX")"
+      fi
+      sudo -u "\$AI_USER" mv -- "\$avd/\$name" "\$backup/"
+      echo "[omp-android] archived: \$name"
+    fi
+  done
+  if [[ -n "\$backup" ]]; then
+    echo "[omp-android] Lock archive: \$backup (do not restore into the AVD)"
+  else
+    echo "[omp-android] No known stale lock files found. Nothing changed."
+  fi
+}
+
 case "\${1:-status}" in
   start)
-    pctl start "\$CONTAINER" >/dev/null
-    echo "[omp-android] starting..."
-    echo "[omp-android] connect from workbench with:"
-    echo "  adb connect ompai-android:15555"
+    if running; then
+      echo "[omp-android] container already running; checking Android boot..."
+    else
+      pctl start "\$CONTAINER" >/dev/null
+      echo "[omp-android] container started; checking Android boot..."
+    fi
+    wait_for_boot
     ;;
   stop)
-    pctl stop -t 10 "\$CONTAINER" >/dev/null 2>&1 || true
-    echo "[omp-android] stopped"
+    if running; then
+      pctl stop -t 60 "\$CONTAINER" >/dev/null
+    fi
+    echo "[omp-android] stopped (AVD preserved)"
     ;;
   restart)
     "\$0" stop
@@ -265,24 +390,30 @@ case "\${1:-status}" in
   logs)
     pctl logs --tail="\${2:-200}" "\$CONTAINER"
     ;;
+  recover-locks)
+    recover_locks
+    ;;
   reset)
     echo "This wipes ONLY the virtual Android device data."
     read -r -p "Type RESET to continue: " x
     [[ "\$x" == "RESET" ]] || exit 1
-    pctl stop -t 10 "\$CONTAINER" >/dev/null 2>&1 || true
+    if running; then
+      pctl stop -t 60 "\$CONTAINER" >/dev/null || exit 1
+    fi
+    ensure_stopped || exit 1
     sudo find "\$AVD_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     echo "[omp-android] AVD data wiped; run: omp-android start"
     ;;
   *)
-    echo "Usage: omp-android {start|stop|restart|status|logs [N]|reset}" >&2
+    echo "Usage: omp-android {start|stop|restart|status|logs [N]|recover-locks|reset}" >&2
     exit 2
     ;;
 esac
 EOF_HELPER
 sudo chmod 0755 /usr/local/bin/omp-android
 
-log "Starting emulator..."
-as_ai podman start "$EMU_CONTAINER" >/dev/null
+log "Starting/checking emulator boot..."
+sudo /usr/local/bin/omp-android start
 
 echo
 log "Installed."
@@ -296,7 +427,7 @@ echo "ADB endpoint:      ompai-android:15555 (private $ANDROID_NET network)"
 echo "Outbound internet: $ANDROID_INTERNET"
 echo
 echo "Inside the workbench:"
-echo "  omp-ai shell"
+echo "  omp-ai workbench-shell"
 echo "  adb connect ompai-android:15555"
 echo "  adb devices -l"
 echo
@@ -305,4 +436,5 @@ echo "  omp-android start"
 echo "  omp-android stop"
 echo "  omp-android status"
 echo "  omp-android logs 200"
-echo "  omp-android reset"
+echo "  omp-android recover-locks  # ONLY if stopped and locks are stale"
+echo "  omp-android reset         # DESTRUCTIVE: wipes virtual Android data"
